@@ -175,6 +175,15 @@ export class TaskProvider implements vscode.TaskProvider {
     },
     {
       group: "Build",
+      name: "Update Rust SDK",
+      icon: "cloud-download",
+      builders: { ["rust"]: this.rustUpdateSdkExec },
+      toolTip: "Update ledger_device_sdk to the latest version in Cargo.lock",
+      state: "enabled",
+      allSelectedBehavior: "enable",
+    },
+    {
+      group: "Build",
       name: "Clean Target Build",
       icon: "trash",
       builders: { ["c"]: this.cCleanTargetExec },
@@ -554,7 +563,7 @@ export class TaskProvider implements vscode.TaskProvider {
 
     const exec = `docker exec ${getDockerUserOpt()} -it ${this.containerName} bash -c 'cd ${
       this.buildDir
-    } && cargo ledger build ${this.tgtSelector.getSelectedSDKModel()} -- ${debug} -Zunstable-options --out-dir build/${tgtBuildDir}/bin && mv build/${tgtBuildDir}/bin/${
+    } && cargo ledger build ${this.tgtSelector.getSelectedSDKModel()} -- ${debug} -Zunstable-options --artifact-dir build/${tgtBuildDir}/bin && mv build/${tgtBuildDir}/bin/${
 
       this.packageName
     } build/${tgtBuildDir}/bin/app.elf && mv build/${tgtBuildDir}/bin/${
@@ -581,6 +590,11 @@ export class TaskProvider implements vscode.TaskProvider {
   private cCleanAllExec(): string {
     // Cleans all app build files (for all device models).
     const exec = `docker exec ${getDockerUserOpt()} -it ${this.containerName} bash -c 'make -C ${this.buildDir} clean'`;
+    return exec;
+  }
+
+  private rustUpdateSdkExec(): string {
+    const exec = `docker exec ${getDockerUserOpt()} -it ${this.containerName} bash -c 'cd ${this.buildDir} && cargo update ledger_device_sdk'`;
     return exec;
   }
 
