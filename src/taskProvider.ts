@@ -563,7 +563,7 @@ export class TaskProvider implements vscode.TaskProvider {
 
     const exec = `docker exec ${getDockerUserOpt()} -it ${this.containerName} bash -c 'cd ${
       this.buildDir
-    } && cargo ledger build ${this.tgtSelector.getSelectedSDKModel()} -- ${debug} -Zunstable-options --artifact-dir build/${tgtBuildDir}/bin && mv build/${tgtBuildDir}/bin/${
+    } && cargo ledger build ${this.tgtSelector.getSelectedSDKModel()} -- ${debug} -Zunstable-options --artifact-dir=build/${tgtBuildDir}/bin && mv build/${tgtBuildDir}/bin/${
 
       this.packageName
     } build/${tgtBuildDir}/bin/app.elf && mv build/${tgtBuildDir}/bin/${
