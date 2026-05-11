@@ -32,14 +32,22 @@
     sendSelectedTests,
   }: Props = $props();
 
-  let searchQuery = $state('');
+  let searchQuery = $state("");
+  let searchOpen = $state(false);
+  let searchInput = $state<HTMLInputElement | null>(null);
   let collapsedFiles = $state<Set<string>>(new Set());
+
+  function toggleSearch() {
+    searchOpen = !searchOpen;
+    if (!searchOpen) searchQuery = "";
+    else setTimeout(() => searchInput?.focus(), 0);
+  }
 
   let groups = $derived.by<TestGroup[]>(() => {
     const map = new Map<string, TestCase[]>();
     for (const t of testCases) {
       const parts = t.id.split("::");
-      const file = parts.length > 1 ? parts.slice(0, parts.length - 1).join("::") : '';
+      const file = parts.length > 1 ? parts.slice(0, parts.length - 1).join("::") : "";
       if (!map.has(file)) map.set(file, []);
       map.get(file)!.push(t);
     }
@@ -60,9 +68,7 @@
       .filter((g) => g.tests.length > 0);
   });
 
-  let filteredTests = $derived.by<TestCase[]>(() =>
-    filteredGroups.flatMap((g) => g.tests)
-  );
+  let filteredTests = $derived.by<TestCase[]>(() => filteredGroups.flatMap((g) => g.tests));
 
   function toggleAllTests(select: boolean) {
     testCases.forEach((t) => (t.selected = select));
@@ -93,7 +99,17 @@
   }
 
   function fileLabel(file: string): string {
-    return file || '(root)';
+    return file || "(root)";
+  }
+
+  let allCollapsed = $derived(groups.length > 0 && groups.every((g) => g.collapsed));
+  let allSelected = $derived(testCases.length > 0 && testCases.every((t) => t.selected));
+  let allFilteredSelected = $derived(
+    filteredTests.length > 0 && filteredTests.every((t) => t.selected),
+  );
+
+  function toggleCollapseTestsGroups() {
+    collapsedFiles = allCollapsed ? new Set() : new Set(groups.map((g) => g.file));
   }
 </script>
 
@@ -113,44 +129,78 @@
     </span>
     <div class="test-header-actions">
       {#if !isRefreshing}
-        <button class="icon-button" onclick={() => toggleAllTests(true)} title="Select all">
-          <i class="codicon codicon-check-all"></i>
+        <button
+          class="icon-button"
+          onclick={() => toggleCollapseTestsGroups()}
+          title={allCollapsed ? "Expand all" : "Collapse all"}
+        >
+          {#if allCollapsed}
+            <i class="codicon codicon-expand-all"></i>
+          {:else}
+            <i class="codicon codicon-collapse-all"></i>
+          {/if}
         </button>
-        <button class="icon-button" onclick={() => toggleAllTests(false)} title="Deselect all">
-          <i class="codicon codicon-close-all"></i>
+        <button
+          class="icon-button"
+          onclick={() => toggleAllTests(!allSelected)}
+          title={allSelected ? "Deselect all" : "Select all"}
+        >
+          <i class="codicon {allSelected ? 'codicon-close-all' : 'codicon-check-all'}"></i>
+        </button>
+        <button
+          class="icon-button {searchOpen ? 'active' : ''}"
+          onclick={toggleSearch}
+          title="Filter tests"
+        >
+          <i class="codicon codicon-search"></i>
         </button>
       {/if}
       <button class="icon-button" onclick={refreshTests} title="Refresh test list">
         <i class="codicon codicon-refresh {isRefreshing ? 'spinning' : ''}"></i>
       </button>
+
       <span class="test-count">{getSelectedTestCount()}/{testCases.length}</span>
     </div>
   </div>
-  <div class="test-search">
-    <i class="codicon codicon-search search-icon"></i>
-    <input
-      type="text"
-      class="search-input"
-      placeholder="Filter tests..."
-      bind:value={searchQuery}
-    />
-    {#if searchQuery}
-      <button class="icon-button" onclick={() => toggleFilteredTests(true)} title="Select filtered">
-        <i class="codicon codicon-check"></i>
-      </button>
-      <button class="icon-button" onclick={() => toggleFilteredTests(false)} title="Deselect filtered">
-        <i class="codicon codicon-dash"></i>
-      </button>
-      <button class="icon-button clear-button" onclick={() => (searchQuery = '')} title="Clear filter">
-        <i class="codicon codicon-x"></i>
-      </button>
+  <div class="test-search-wrapper" use:autoAnimate>
+    {#if searchOpen && !isRefreshing}
+      <div class="test-search">
+        <div class="search-input-wrapper">
+          <input
+            type="text"
+            class="search-input"
+            placeholder="Filter tests..."
+            bind:value={searchQuery}
+            bind:this={searchInput}
+            style:padding-right={searchQuery ? "62px" : "4px"}
+          />
+          {#if searchQuery}
+            <div class="search-input-actions">
+              <button
+                class="icon-button"
+                onclick={() => toggleFilteredTests(!allFilteredSelected)}
+                title={allFilteredSelected ? "Deselect filtered" : "Select filtered"}
+              >
+                <i class="codicon {allFilteredSelected ? 'codicon-dash' : 'codicon-check'}"></i>
+              </button>
+              <button class="icon-button" onclick={() => (searchQuery = "")} title="Clear filter">
+                <i class="codicon codicon-x"></i>
+              </button>
+            </div>
+          {/if}
+        </div>
+      </div>
     {/if}
   </div>
   <div class="test-list-compact">
     {#each filteredGroups as group (group.file)}
       {#if group.file}
         <button class="file-header" onclick={() => toggleFile(group.file)} title={group.file}>
-          <i class="codicon {group.collapsed ? 'codicon-chevron-right' : 'codicon-chevron-down'} collapse-icon"></i>
+          <i
+            class="codicon {group.collapsed
+              ? 'codicon-chevron-right'
+              : 'codicon-chevron-down'} collapse-icon"
+          ></i>
           <i class="codicon codicon-file file-icon"></i>
           <span class="file-name">{fileLabel(group.file)}</span>
         </button>
@@ -228,6 +278,11 @@
     color: var(--vscode-foreground);
   }
 
+  .icon-button.active {
+    color: var(--vscode-foreground);
+    background-color: var(--vscode-list-hoverBackground);
+  }
+
   .icon-button .spinning {
     animation: spin 0.8s linear infinite;
   }
@@ -251,20 +306,17 @@
   }
 
   .test-search {
-    display: flex;
-    align-items: center;
-    gap: 4px;
     padding: 4px 10px;
   }
 
-  .search-icon {
-    font-size: 12px;
-    color: var(--vscode-descriptionForeground);
-    flex-shrink: 0;
+  .search-input-wrapper {
+    position: relative;
+    display: flex;
+    align-items: center;
   }
 
   .search-input {
-    flex: 1;
+    width: 100%;
     background: var(--vscode-input-background);
     color: var(--vscode-input-foreground);
     border: 1px solid var(--vscode-input-border, transparent);
@@ -272,7 +324,17 @@
     padding: 2px 4px;
     font-size: 11px;
     outline: none;
-    min-width: 0;
+    box-sizing: border-box;
+  }
+
+  .search-input-actions {
+    position: absolute;
+    right: 2px;
+    top: 50%;
+    transform: translateY(-50%);
+    display: flex;
+    align-items: center;
+    gap: 2px;
   }
 
   .search-input:focus {
@@ -281,10 +343,6 @@
 
   .search-input::placeholder {
     color: var(--vscode-input-placeholderForeground);
-  }
-
-  .clear-button {
-    flex-shrink: 0;
   }
 
   .test-list-compact {
