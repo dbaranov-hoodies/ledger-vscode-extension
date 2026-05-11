@@ -5,13 +5,20 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.5.1]
+
+### Added
+
+* Fixed Rust app building issue with new cargo-ledger
+* Add search/filter bar to the test list with select/deselect filtered buttons.
+* Organize test list as a tree grouped by test file, with collapsible file sections.
+* Add tooltip on each test item showing the full pytest node ID (file path + test name).
+
 ## [2.4.2]
 
 ### Added
 
-* Add search/filter bar to the test list with select/deselect filtered buttons.
-* Organize test list as a tree grouped by test file, with collapsible file sections.
-* Add tooltip on each test item showing the full pytest node ID (file path + test name).
+* CI : publish to open-vsx store
 
 ## [2.4.1]
 
