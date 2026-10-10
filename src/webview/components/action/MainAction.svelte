@@ -29,8 +29,8 @@
   <button
     class="button"
     data-status={status}
-    title={action?.tooltip}
-    disabled={!action || disabled || status === "running"}
+    title={status === "running" ? "Click to stop" : action?.tooltip}
+    disabled={!action || ((disabled || action.disabled) && status !== "running")}
     onclick={execute}
   >
     <span class="icon"><i class="codicon codicon-{icon}"></i></span>

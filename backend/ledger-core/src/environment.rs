@@ -7,6 +7,7 @@ use crate::actions::ActionId;
 use crate::container::Observation;
 use crate::device_ops::DeviceSettings;
 use crate::docker::ContainerUser;
+use crate::failures::Failures;
 use crate::host_python::HostPython;
 use crate::test_tree::TestTree;
 
@@ -22,6 +23,8 @@ pub struct Environment {
     /// The tests of the selected suite, once they were collected.
     pub test_tree: Option<TestTree>,
     pub collecting_tests: bool,
+    /// The tests of that list that failed their last run, on each device.
+    pub failures: Failures,
     /// The selected suite ships the scripts that prepare its dependencies.
     pub test_helpers: bool,
     pub running: BTreeSet<ActionId>,

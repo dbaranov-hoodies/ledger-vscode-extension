@@ -12,6 +12,7 @@ use crate::language::Language;
 use crate::selection::AppSelection;
 use crate::task::{self, ComposeRun, Options, Task, TestMode, TestRun, Variant};
 use crate::test_deps::TestDependencies;
+use crate::test_tree::TestSelection;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize, TS)]
 #[ts(export)]
@@ -386,6 +387,8 @@ pub enum DisabledReason {
     DeviceActionsOff,
     NoComposeFile,
     NoTestSuite,
+    /// The tests were all unchecked.
+    NoTestSelected,
     NoAiModel,
 }
 
@@ -487,10 +490,21 @@ fn disabled_reason(
                 .is_none_or(|device| device_ops::allowed(device, &env.settings.device));
             (!allowed).then_some(DisabledReason::DeviceActionsOff)
         }
-        Run::Task(Task::RunTests(_) | Task::PrepareTestDependencies { .. }) => {
-            suite_directory(app, selection)
-                .is_none()
-                .then_some(DisabledReason::NoTestSuite)
+        Run::Task(Task::PrepareTestDependencies { .. }) => suite_directory(app, selection)
+            .is_none()
+            .then_some(DisabledReason::NoTestSuite),
+        Run::Task(Task::RunTests(_)) => {
+            if suite_directory(app, selection).is_none() {
+                Some(DisabledReason::NoTestSuite)
+            } else if selection
+                .tests
+                .as_ref()
+                .is_some_and(TestSelection::is_empty)
+            {
+                Some(DisabledReason::NoTestSelected)
+            } else {
+                None
+            }
         }
         Run::Task(Task::ComposeTerminal) => app
             .compose_file
@@ -785,6 +799,29 @@ mod tests {
         );
         assert_eq!(reason(ActionId::AiReview), Some(DisabledReason::NoAiModel));
         assert_eq!(reason(ActionId::BuildApp), None);
+    }
+
+    #[test]
+    fn unchecking_every_test_turns_off_the_actions_that_run_them() {
+        let app = c_app();
+        let mut selection = selection(&app);
+        selection.tests = Some(TestSelection::default());
+
+        let groups = groups(&app, &selection, &environment(&app));
+
+        for id in [
+            ActionId::RunTests,
+            ActionId::TestsWithDisplay,
+            ActionId::TestsOnDevice,
+            ActionId::GenerateSnapshots,
+        ] {
+            assert_eq!(
+                find(&groups, id).disabled_reason,
+                Some(DisabledReason::NoTestSelected),
+                "{id:?}"
+            );
+        }
+        assert!(find(&groups, ActionId::PrepareTestDependencies).enabled);
     }
 
     #[test]

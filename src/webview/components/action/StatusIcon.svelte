@@ -16,6 +16,7 @@
   <span class="status" class:small data-status={status}>
     {#if status === "running"}
       <span class="spinner"></span>
+      <i class="codicon codicon-debug-stop stop" style="font-size: {size}px"></i>
     {:else if status === "success"}
       <Check {size} animate />
     {:else}
@@ -50,6 +51,19 @@
     border-top-color: transparent;
     border-radius: 50%;
     animation: spin 0.8s linear infinite;
+  }
+
+  /* Pointing at a running action shows that clicking stops it. */
+  .stop {
+    display: none;
+  }
+
+  :global(.button:hover) .stop {
+    display: inline-block;
+  }
+
+  :global(.button:hover) .spinner {
+    display: none;
   }
 
   .small .spinner {

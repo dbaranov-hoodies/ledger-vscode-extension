@@ -56,10 +56,6 @@
     },
     "commands": [
       {
-        "command": "executeTask",
-        "title": "Execute Build Task"
-      },
-      {
         "command": "selectTarget",
         "title": "Select device",
         "category": "Ledger",
@@ -79,24 +75,10 @@
         "tooltip": "Select the use case you want to build with."
       },
       {
-        "command": "selectTestUseCase",
-        "title": "Select test use case",
-        "category": "Ledger",
-        "tooltip": "Select the test use case you want to run, when manifest contains multiple test use cases.",
-        "icon": "$(selection)",
-        "enablement": "ledgerDevTools.showSelectTestUseCase"
-      },
-      {
         "command": "showAppList",
         "title": "Select app",
         "category": "Ledger",
         "tooltip": "Select the app you want to build."
-      },
-      {
-        "command": "additionalReqsPerApp",
-        "title": "Add test dependencies",
-        "category": "Ledger",
-        "tooltip": "Add additional test dependencies to install for selected app."
       },
       {
         "command": "selectCheck",
@@ -110,6 +92,12 @@
         "category": "Ledger",
         "tooltip": "Analyze modified files against Ledger embedded application rules using AI.",
         "icon": "$(sparkle)"
+      },
+      {
+        "command": "ledgerDevTools.stopRunning",
+        "title": "Stop running action",
+        "category": "Ledger",
+        "tooltip": "Stop the actions that are running, such as a build or the tests."
       }
     ],
     "configuration": {
@@ -180,16 +168,6 @@
           "type": "boolean",
           "default": false,
           "markdownDescription": "Allow device operations on Nano X (requires special development device)"
-        },
-        "ledgerDevTools.useRustBackend": {
-          "type": "boolean",
-          "default": false,
-          "markdownDescription": "Experimental: use the Rust backend (a sidecar process) instead of the TypeScript one. Reload the window to apply."
-        },
-        "ledgerDevTools.sidecarPath": {
-          "type": "string",
-          "default": "",
-          "markdownDescription": "Path of the Rust backend executable. Leave empty to use the one that comes with the extension, or the one built in `backend/target`."
         },
         "ledgerDevTools.appSettings": {
           "type": "object",
@@ -324,7 +302,7 @@
     }
   },
   "scripts": {
-    "vscode:prepublish": "npm run package",
+    "vscode:prepublish": "npm run package && npm run bundle:sidecar",
     "build:sidecar": "cargo build --manifest-path backend/Cargo.toml -p ledger-sidecar",
     "compile": "webpack",
     "watch": "webpack --watch",
@@ -341,7 +319,8 @@
     "deploy-vsix": "vsce publish -i extension.vsix",
     "deploy-vsix-prerelease": "vsce publish --pre-release -i extension.vsix",
     "deploy-ovsx": "ovsx publish",
-    "deploy-ovsx-vsix": "ovsx publish extension.vsix"
+    "deploy-ovsx-vsix": "ovsx publish extension.vsix",
+    "bundle:sidecar": "node scripts/bundle-sidecar.js"
   },
   "dependencies": {
     "@formkit/auto-animate": "^0.9.0",

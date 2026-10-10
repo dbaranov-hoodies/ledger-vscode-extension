@@ -2,7 +2,7 @@
 //!
 //! Every node id is a pytest node id, so any node, not only a test, can be handed to pytest.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 
 use serde::Serialize;
 use ts_rs::TS;
@@ -58,8 +58,42 @@ impl TestTree {
         &self.roots
     }
 
+    /// The node with this pytest id, at any depth.
+    pub fn find(&self, id: &str) -> Option<&TestNode> {
+        fn search<'a>(nodes: &'a [TestNode], id: &str) -> Option<&'a TestNode> {
+            nodes.iter().find_map(|node| {
+                if node.id == id {
+                    Some(node)
+                } else {
+                    search(&node.children, id)
+                }
+            })
+        }
+        search(&self.roots, id)
+    }
+
     pub fn tests(&self) -> Vec<&TestNode> {
         self.roots.iter().flat_map(TestNode::tests).collect()
+    }
+
+    /// Every node by the ids a pytest run from the app folder may print for it: its own id, and
+    /// that id with the directory of the suite in front. Without parameters, so a test is
+    /// found by the id of any of its variants once they are dropped with [`without_parameters`].
+    pub fn nodes_by_run_id(&self, suite_directory: &str) -> HashMap<String, &TestNode> {
+        fn add<'a>(
+            nodes: &'a [TestNode],
+            directory: &str,
+            found: &mut HashMap<String, &'a TestNode>,
+        ) {
+            for node in nodes {
+                found.insert(node.id.clone(), node);
+                found.insert(path_from_app(directory, &node.id), node);
+                add(&node.children, directory, found);
+            }
+        }
+        let mut found = HashMap::new();
+        add(&self.roots, suite_directory, &mut found);
+        found
     }
 
     fn insert(&mut self, steps: Vec<Step>) {
@@ -85,6 +119,11 @@ impl TestTree {
     }
 }
 
+/// The id of a test without the parameters of a variant: `test_a[nanox]` is `test_a`.
+pub(crate) fn without_parameters(id: &str) -> &str {
+    id.split_once('[').map_or(id, |(id, _parameters)| id)
+}
+
 struct Step {
     kind: NodeKind,
     name: String,
@@ -93,8 +132,7 @@ struct Step {
 
 /// The nodes from the top directory down to the test of one line of collection output.
 fn steps_of(line: &str) -> Option<Vec<Step>> {
-    let line = line.trim();
-    let id = line.split_once('[').map_or(line, |(id, _params)| id);
+    let id = without_parameters(line.trim());
     let mut segments = id.split("::");
     let path = segments.next()?;
     let inner: Vec<&str> = segments.collect();
@@ -251,7 +289,7 @@ impl TestSelection {
 
 /// pytest prints ids relative to its root directory, which may be the suite directory, the
 /// app folder or something in between. Adds the missing part of the suite directory in front.
-fn path_from_app(suite_directory: &str, id: &str) -> String {
+pub(crate) fn path_from_app(suite_directory: &str, id: &str) -> String {
     let directory = suite_directory
         .trim_start_matches("./")
         .trim_end_matches('/');
@@ -507,6 +545,18 @@ sub/test_deep.py::test_c
         selection.retain_existing(&after);
 
         assert_eq!(selection, TestSelection::all(&after));
+    }
+
+    #[test]
+    fn a_node_is_found_at_any_depth() {
+        let tree = tree();
+
+        assert_eq!(tree.find("sub").unwrap().kind, NodeKind::Directory);
+        assert_eq!(
+            tree.find("sub/test_deep.py::TestFoo::test_a").unwrap().kind,
+            NodeKind::Test
+        );
+        assert!(tree.find("sub/nope.py").is_none());
     }
 
     #[test]

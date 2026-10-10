@@ -72,10 +72,48 @@ pub fn info() -> Command {
     docker(["info"]).timeout(LOCAL_TIMEOUT)
 }
 
-/// Prints the Docker status of a container and the id of its image, such as
-/// `running sha256:…`. Fails when there is no such container.
+/// Where the app folder is mounted in the containers.
+pub const APP_DIR: &str = "/app";
+
+/// Where the pip cache is mounted in the containers.
+pub const PIP_CACHE_DIR: &str = "/pip-cache";
+
+/// The volume that holds the pip cache the containers of a user share. Pip only writes to a
+/// cache that its user owns, so each user has a volume of their own.
+pub fn pip_cache_volume(user: ContainerUser) -> String {
+    match user {
+        ContainerUser::Root => "ledger-pip-cache".to_owned(),
+        ContainerUser::Host { uid, .. } => format!("ledger-pip-cache-{uid}"),
+    }
+}
+
+pub fn create_volume(name: &str) -> Command {
+    docker(["volume", "create", name]).timeout(LOCAL_TIMEOUT)
+}
+
+/// Gives the pip cache volume to the user of the containers, which Docker creates as root's.
+/// Root needs nothing.
+pub fn own_pip_cache(image: &str, volume: &str, user: ContainerUser) -> Option<Command> {
+    let ContainerUser::Host { uid, gid } = user else {
+        return None;
+    };
+    Some(
+        docker(["run", "--rm", "--pull", "never", "--user", "0"])
+            .args(["-v".to_owned(), format!("{volume}:{PIP_CACHE_DIR}")])
+            .args([image.to_owned(), "chown".to_owned()])
+            .arg(format!("{uid}:{gid}"))
+            .arg(PIP_CACHE_DIR)
+            .timeout(LOCAL_TIMEOUT),
+    )
+}
+
+/// Prints the Docker status of a container, the id of its image and the volume of its pip cache,
+/// such as `running sha256:… ledger-pip-cache-1000`. Fails when there is no such container.
 pub fn container_status(container: &str) -> Command {
-    docker(["inspect", "-f", "{{.State.Status}} {{.Image}}", container]).timeout(LOCAL_TIMEOUT)
+    let format = format!(
+        "{{{{.State.Status}}}} {{{{.Image}}}} {{{{range .Mounts}}}}{{{{if eq .Destination \"{PIP_CACHE_DIR}\"}}}}{{{{.Name}}}}{{{{end}}}}{{{{end}}}}"
+    );
+    docker(["inspect", "-f", &format, container]).timeout(LOCAL_TIMEOUT)
 }
 
 /// Prints the id of the local image, and fails when it is not there.
@@ -135,9 +173,11 @@ pub fn host_mount_path(uri_path: &str, platform: Platform) -> String {
 pub struct CreateContainer<'a> {
     pub name: &'a str,
     pub image: &'a str,
-    /// Host path of the app folder, mounted at `/app`.
+    /// Host path of the app folder, mounted at [`APP_DIR`].
     pub app_dir: &'a str,
     pub user: ContainerUser,
+    /// The volume of the pip cache, see [`pip_cache_volume`].
+    pub pip_cache: &'a str,
     /// The user's own `docker run` arguments, already split.
     pub extra_args: &'a [String],
     pub platform: Platform,
@@ -177,13 +217,17 @@ pub fn create_container(spec: &CreateContainer) -> Command {
     }
 
     command
-        .args(["-v".to_owned(), format!("{}:/app", spec.app_dir)])
+        .args(["-v".to_owned(), format!("{}:{APP_DIR}", spec.app_dir)])
         .args(spec.extra_args.iter().cloned())
         .args([
-            "-v",
-            "ledger-pip-cache:/pip-cache",
+            "-v".to_owned(),
+            format!("{}:{PIP_CACHE_DIR}", spec.pip_cache),
+        ])
+        .args([
             "-e",
             "PIP_CACHE_DIR=/pip-cache",
+            "-e",
+            "PIP_DISABLE_PIP_VERSION_CHECK=1",
             "-t",
             "-d",
             "--name",
@@ -211,7 +255,7 @@ pub fn parse_first_service(output: &str) -> Option<&str> {
 
 pub struct RunMake<'a> {
     pub image: &'a str,
-    /// Host path of the app folder, mounted at `/app`.
+    /// Host path of the app folder, mounted at [`APP_DIR`].
     pub app_dir: &'a str,
     /// Relative to the app folder, where `make` runs.
     pub build_directory: &'a str,
@@ -224,8 +268,8 @@ pub struct RunMake<'a> {
 pub fn run_make(spec: &RunMake) -> Command {
     docker(["run", "--rm", "--pull", "never"])
         .args(spec.user.args())
-        .args(["-v".to_owned(), format!("{}:/app", spec.app_dir)])
-        .args(["-w", "/app", "-e"])
+        .args(["-v".to_owned(), format!("{}:{APP_DIR}", spec.app_dir)])
+        .args(["-w", APP_DIR, "-e"])
         .arg(format!("BOLOS_SDK={ANY_SDK}"))
         .args([spec.image, "make", "-C", spec.build_directory, spec.target])
         .timeout(MAKE_TIMEOUT)
@@ -318,6 +362,7 @@ mod tests {
                 uid: 1000,
                 gid: 1001,
             },
+            pip_cache: "ledger-pip-cache-1000",
             extra_args: extra,
             platform: Platform::Linux,
             display,
@@ -338,6 +383,48 @@ mod tests {
         assert_eq!(
             compose_run("/w/docker-compose.yml", user, "builder").shell_line(),
             "docker compose -f /w/docker-compose.yml run --rm --remove-orphans --user 1000:1001 builder"
+        );
+    }
+
+    #[test]
+    fn each_user_has_a_pip_cache_of_their_own_because_pip_only_writes_to_what_it_owns() {
+        let user = ContainerUser::Host {
+            uid: 1000,
+            gid: 1001,
+        };
+
+        assert_eq!(pip_cache_volume(user), "ledger-pip-cache-1000");
+        assert_eq!(pip_cache_volume(ContainerUser::Root), "ledger-pip-cache");
+    }
+
+    #[test]
+    fn the_pip_cache_is_given_to_the_user_by_a_throwaway_container_that_runs_as_root() {
+        let user = ContainerUser::Host {
+            uid: 1000,
+            gid: 1001,
+        };
+
+        let own = own_pip_cache("img:latest", "ledger-pip-cache-1000", user).unwrap();
+
+        assert_eq!(
+            own.shell_line(),
+            "docker run --rm --pull never --user 0 -v ledger-pip-cache-1000:/pip-cache img:latest chown 1000:1001 /pip-cache"
+        );
+        assert!(own_pip_cache("img:latest", "ledger-pip-cache", ContainerUser::Root).is_none());
+        assert_eq!(
+            create_volume("ledger-pip-cache-1000").shell_line(),
+            "docker volume create ledger-pip-cache-1000"
+        );
+    }
+
+    #[test]
+    fn the_status_of_a_container_includes_the_volume_of_its_pip_cache() {
+        let line = container_status("app-x-container-stax").shell_line();
+
+        assert!(line.contains("{{.State.Status}} {{.Image}}"), "{line}");
+        assert!(
+            line.contains("{{if eq .Destination \"/pip-cache\"}}{{.Name}}"),
+            "{line}"
         );
     }
 
@@ -412,9 +499,11 @@ mod tests {
                 "--network",
                 "host",
                 "-v",
-                "ledger-pip-cache:/pip-cache",
+                "ledger-pip-cache-1000:/pip-cache",
                 "-e",
                 "PIP_CACHE_DIR=/pip-cache",
+                "-e",
+                "PIP_DISABLE_PIP_VERSION_CHECK=1",
                 "-t",
                 "-d",
                 "--name",
@@ -623,10 +712,9 @@ mod tests {
 
     #[test]
     fn the_status_and_digest_commands_are_plain_argument_lists() {
-        assert_eq!(
-            container_status("c").args,
-            ["inspect", "-f", "{{.State.Status}} {{.Image}}", "c"]
-        );
+        let status = container_status("c").args;
+        assert_eq!(status[..2], ["inspect", "-f"]);
+        assert_eq!(status[3], "c");
         assert_eq!(
             image_id("img").args,
             ["image", "inspect", "-f", "{{.Id}}", "img"]

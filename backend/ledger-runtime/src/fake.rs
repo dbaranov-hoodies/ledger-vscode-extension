@@ -10,6 +10,9 @@ use crate::runner::{CommandRunner, Output};
 /// The id of the local image, until a pull brings another one.
 pub const FIRST_IMAGE: &str = "sha256:image1";
 
+/// The pip cache volume of a container made for the user 1000, which the tests use.
+pub const PIP_CACHE: &str = "ledger-pip-cache-1000";
+
 /// A tiny in-memory Docker. It answers the commands of the container lifecycle, changes its
 /// containers accordingly, records every command it was given, and logs like a real runner.
 /// A command for the host, which is not `docker`, is recorded and succeeds.
@@ -23,8 +26,10 @@ struct State {
     image_id: Option<String>,
     /// The image a pull brings.
     registry_image_id: String,
-    /// Container name to Docker status and image id.
-    containers: BTreeMap<String, (&'static str, String)>,
+    /// Container name to Docker status, image id and the volume of its pip cache.
+    containers: BTreeMap<String, (&'static str, String, String)>,
+    /// The volumes that were created.
+    volumes: Vec<String>,
     calls: Vec<String>,
     /// Commands containing the text fail, this many more times.
     failures: Vec<(String, u32)>,
@@ -34,6 +39,10 @@ struct State {
     make_outputs: BTreeMap<String, String>,
     /// What `docker compose config --services` prints, when there is a compose file.
     compose_services: Option<String>,
+    /// What a `docker exec` prints when its command line contains the text.
+    exec_outputs: Vec<(String, String)>,
+    /// Commands containing the text start, and then never end until they are dropped.
+    blocked: Vec<String>,
 }
 
 impl Default for FakeDocker {
@@ -50,12 +59,15 @@ impl FakeDocker {
                 image_id: Some(FIRST_IMAGE.to_owned()),
                 registry_image_id: FIRST_IMAGE.to_owned(),
                 containers: BTreeMap::new(),
+                volumes: Vec::new(),
                 calls: Vec::new(),
                 failures: Vec::new(),
                 repo_digest: None,
                 remote_manifest: None,
                 make_outputs: BTreeMap::new(),
                 compose_services: None,
+                exec_outputs: Vec::new(),
+                blocked: Vec::new(),
             }),
         }
     }
@@ -90,9 +102,19 @@ impl FakeDocker {
         status: &'static str,
         image_id: &str,
     ) -> Self {
-        self.state_mut()
-            .containers
-            .insert(name.to_owned(), (status, image_id.to_owned()));
+        self.state_mut().containers.insert(
+            name.to_owned(),
+            (status, image_id.to_owned(), PIP_CACHE.to_owned()),
+        );
+        self
+    }
+
+    /// A container that mounts another volume as its pip cache, such as one made by an older version.
+    pub fn with_container_cache(mut self, name: &str, status: &'static str, volume: &str) -> Self {
+        self.state_mut().containers.insert(
+            name.to_owned(),
+            (status, FIRST_IMAGE.to_owned(), volume.to_owned()),
+        );
         self
     }
 
@@ -122,6 +144,21 @@ impl FakeDocker {
         self
     }
 
+    /// A command whose line contains `text` starts, and never ends: like a long run that is
+    /// waiting to be stopped.
+    pub fn blocking(mut self, text: &str) -> Self {
+        self.state_mut().blocked.push(text.to_owned());
+        self
+    }
+
+    /// A `docker exec` whose command line contains `text` prints `stdout`.
+    pub fn with_exec_output(mut self, text: &str, stdout: &str) -> Self {
+        self.state_mut()
+            .exec_outputs
+            .push((text.to_owned(), stdout.to_owned()));
+        self
+    }
+
     /// The compose file lists these services, one per line.
     pub fn with_compose_services(mut self, services: &str) -> Self {
         self.state_mut().compose_services = Some(services.to_owned());
@@ -138,7 +175,22 @@ impl FakeDocker {
             .unwrap()
             .containers
             .get(name)
-            .map(|(status, _)| *status)
+            .map(|(status, ..)| *status)
+    }
+
+    /// The volumes that were created.
+    pub fn volumes(&self) -> Vec<String> {
+        self.state.lock().unwrap().volumes.clone()
+    }
+
+    /// The volume a container mounts as its pip cache.
+    pub fn container_cache(&self, name: &str) -> Option<String> {
+        self.state
+            .lock()
+            .unwrap()
+            .containers
+            .get(name)
+            .map(|(_, _, cache)| cache.clone())
     }
 
     pub fn container_image(&self, name: &str) -> Option<String> {
@@ -147,7 +199,7 @@ impl FakeDocker {
             .unwrap()
             .containers
             .get(name)
-            .map(|(_, image)| image.clone())
+            .map(|(_, image, _)| image.clone())
     }
 
     fn handle(&self, command: &Command) -> Output {
@@ -169,9 +221,16 @@ impl FakeDocker {
 
         let args: Vec<&str> = command.args.iter().map(String::as_str).collect();
         match (command.program.as_str(), args.as_slice()) {
-            ("xhost", _) | ("docker", ["info"] | ["exec", ..]) => success(""),
+            ("docker", ["exec", ..]) => {
+                let scripted = state
+                    .exec_outputs
+                    .iter()
+                    .find(|(text, _)| line.contains(text));
+                success(scripted.map_or("", |(_, stdout)| stdout))
+            }
+            ("xhost", _) | ("docker", ["info"]) => success(""),
             ("docker", ["inspect", "-f", _, name]) => match state.containers.get(*name) {
-                Some((status, image)) => success(&format!("{status} {image}\n")),
+                Some((status, image, cache)) => success(&format!("{status} {image} {cache}\n")),
                 None => failure("No such object"),
             },
             ("docker", ["image", "inspect", "-f", _, _]) => match &state.image_id {
@@ -207,6 +266,11 @@ impl FakeDocker {
                     failure("No such container")
                 }
             }
+            ("docker", ["volume", "create", name]) => {
+                state.volumes.push((*name).to_owned());
+                success(&format!("{name}\n"))
+            }
+            ("docker", ["run", rest @ ..]) if rest.contains(&"chown") => success(""),
             ("docker", ["run", rest @ ..]) if rest.contains(&"--rm") => {
                 let output = rest
                     .last()
@@ -222,11 +286,16 @@ impl FakeDocker {
                     .iter()
                     .position(|arg| *arg == "--name")
                     .and_then(|at| rest.get(at + 1));
+                let cache = rest
+                    .iter()
+                    .find_map(|arg| arg.strip_suffix(":/pip-cache"))
+                    .unwrap_or("");
                 match (name, state.image_id.clone()) {
                     (Some(name), Some(image)) => {
+                        let cache = cache.to_owned();
                         state
                             .containers
-                            .insert((*name).to_owned(), ("running", image));
+                            .insert((*name).to_owned(), ("running", image, cache));
                         success("0123abcd\n")
                     }
                     (Some(_), None) => failure("Unable to find image locally"),
@@ -245,6 +314,11 @@ impl CommandRunner for FakeDocker {
         command: &Command,
         log: Option<&Log>,
     ) -> impl Future<Output = io::Result<Output>> + Send {
+        let line = command.shell_line();
+        let blocked = {
+            let state = self.state.lock().unwrap();
+            state.blocked.iter().any(|text| line.contains(text))
+        };
         let output = self.handle(command);
         if let Some(log) = log {
             log.started(command);
@@ -258,13 +332,18 @@ impl CommandRunner for FakeDocker {
                 .for_each(|line| log.line(Stream::Stderr, line));
             log.finished(output.success);
         }
-        async move { Ok(output) }
+        async move {
+            if blocked {
+                std::future::pending::<()>().await;
+            }
+            Ok(output)
+        }
     }
 }
 
 fn set_status(state: &mut State, name: &str, status: &'static str) -> Output {
     match state.containers.get_mut(name) {
-        Some((current, _)) => {
+        Some((current, ..)) => {
             *current = status;
             success("")
         }

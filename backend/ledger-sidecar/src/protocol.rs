@@ -17,7 +17,15 @@ pub const SET_DEVICES: &str = "setDevices";
 pub const SET_BUILD_USE_CASE: &str = "setBuildUseCase";
 pub const SET_VARIANT: &str = "setVariant";
 pub const SET_ENFORCER_CHECK: &str = "setEnforcerCheck";
+pub const COLLECT_TESTS: &str = "collectTests";
+pub const TOGGLE_TEST: &str = "toggleTest";
+pub const SET_TESTS: &str = "setTests";
+pub const SELECT_FAILED_TESTS: &str = "selectFailedTests";
+pub const LOCATE_TEST: &str = "locateTest";
+pub const SET_TEST_SUITE: &str = "setTestSuite";
+pub const SET_AI: &str = "setAi";
 pub const RUN_ACTION: &str = "runAction";
+pub const CANCEL_ACTION: &str = "cancelAction";
 
 pub const SNAPSHOT: &str = "snapshot";
 pub const SAVED: &str = "saved";
@@ -159,7 +167,58 @@ pub struct SetEnforcerCheckParams {
 
 #[derive(Debug, Clone, Deserialize, TS)]
 #[ts(export)]
+pub struct ToggleTestParams {
+    /// The pytest id of a directory, file, class or test: all the tests below it change together.
+    pub id: String,
+}
+
+#[derive(Debug, Clone, Deserialize, TS)]
+#[ts(export)]
+pub struct SetTestsParams {
+    /// The pytest ids of the tests to run. `null` runs every test.
+    pub ids: Option<Vec<String>>,
+}
+
+#[derive(Debug, Clone, Deserialize, TS)]
+#[ts(export)]
+pub struct LocateTestParams {
+    /// The pytest id of a file, class or test. A directory has no source to open.
+    pub id: String,
+}
+
+/// Where a test is written, for the extension to open.
+#[derive(Debug, Clone, Serialize, TS)]
+#[ts(export)]
+pub struct TestLocation {
+    /// The path of the file on the host.
+    pub path: String,
+    /// The line where the test starts, counting from 1.
+    pub line: u32,
+}
+
+#[derive(Debug, Clone, Deserialize, TS)]
+#[ts(export)]
+pub struct SetTestSuiteParams {
+    pub name: String,
+}
+
+/// The language models that the extension can use for the AI review. Only VS Code knows them.
+#[derive(Debug, Clone, Deserialize, TS)]
+#[ts(export)]
+pub struct SetAiParams {
+    pub models: Vec<String>,
+    pub selected: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, TS)]
+#[ts(export)]
 pub struct RunActionParams {
+    pub id: ActionId,
+}
+
+#[derive(Debug, Clone, Deserialize, TS)]
+#[ts(export)]
+pub struct CancelActionParams {
     pub id: ActionId,
 }
 
@@ -176,6 +235,8 @@ pub struct SavedNotification {
 pub struct ActionFinishedNotification {
     pub id: ActionId,
     pub success: bool,
+    /// The user stopped it, which is not a failure to report.
+    pub cancelled: bool,
     /// Why it failed.
     pub message: Option<String>,
 }

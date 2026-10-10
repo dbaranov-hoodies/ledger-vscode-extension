@@ -11,7 +11,8 @@ use crate::app::{App, join_path};
 use crate::command::Command;
 use crate::device::Device;
 use crate::device_ops::{self, DeviceSettings, DeviceTask};
-use crate::docker::{self, ContainerUser, RunId};
+use crate::docker::{self, APP_DIR, ContainerUser, RunId};
+use crate::failures;
 use crate::host_python::{HostPython, path_text};
 use crate::language::Language;
 use crate::manifest::{BuildUseCase, UseCaseOrigin};
@@ -207,6 +208,67 @@ if [ "$venv" = 1 ]; then export VIRTUAL_ENV=/opt/venv PATH="/opt/venv/bin:$PATH"
 cd "$dir" || exit 1
 exec "$@"
 "##;
+
+/// A shell function that installs the requirements of a suite, if it has any. The containers of
+/// an app share one pip cache, so they install one at a time: the first fills the cache, and
+/// the others find everything in it instead of downloading and building it all again.
+macro_rules! install_requirements {
+    () => {
+        r##"
+install_requirements() {
+  [ -f "$1" ] || return 0
+  cache="${PIP_CACHE_DIR:-/pip-cache}"
+  if [ -w "$cache" ] && command -v flock > /dev/null; then
+    (
+      flock -n 9 || { echo "Waiting for another container to install the requirements..."; flock 9; }
+      pip install -r "$1"
+    ) 9> "$cache/.install.lock"
+  else
+    pip install -r "$1"
+  fi
+}
+"##
+    };
+}
+
+/// Installs the requirements file given as the first argument, see [`install_requirements!`].
+const INSTALL_REQUIREMENTS_SCRIPT: &str =
+    concat!(install_requirements!(), r#"install_requirements "$1""#);
+
+/// Lists the tests of a suite with `pytest --collect-only`, once the requirements of the suite
+/// are installed. The option that gives the device is `--device` or the older `--model`, and
+/// pytest exits with 5 when there is no test, which is no failure.
+const COLLECT_SCRIPT: &str = concat!(
+    install_requirements!(),
+    r##"
+dir="$1"; device="$2"
+install_requirements "$dir/requirements.txt" > /dev/null 2>&1
+cd "$dir" || exit 1
+option=$(pytest --help | awk '/[Cc]ustom options/,/^$/' | grep -E -- '--model|--device' | head -n 1 | tr ' =' '\n' | grep -v '^$' | head -n 1)
+case "$option" in
+  --device) pytest --collect-only -q --device "$device" ;;
+  --model) pytest --collect-only -q --model "$device" ;;
+  *) pytest --collect-only -q ;;
+esac
+status=$?
+[ "$status" -eq 5 ] && exit 0
+exit "$status"
+"##
+);
+
+/// Lists the tests of the suite in `directory`, relative to the app folder, as pytest sees them
+/// for this device. What it prints is read with `TestTree::from_collect_output`.
+pub fn collect_tests(directory: &str, device: Device) -> InContainer {
+    InContainer::new([
+        "bash",
+        "-c",
+        COLLECT_SCRIPT,
+        "_",
+        directory,
+        device.spec().name,
+    ])
+    .venv()
+}
 
 /// A program to run inside a container, without a shell.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -532,12 +594,13 @@ fn tests(device: Device, mode: TestMode, options: &Options) -> Result<Vec<InCont
         InContainer::new([
             "bash",
             "-c",
-            r#"[ ! -f "$1" ] || pip install -r "$1""#,
+            INSTALL_REQUIREMENTS_SCRIPT,
             "_",
             &requirements_file,
         ])
         .venv()
-        .keep_going(),
+        .keep_going()
+        .label(format!("pip install -r {requirements_file}")),
     );
 
     let mut pytest = vec!["pytest".to_owned()];
@@ -547,6 +610,10 @@ fn tests(device: Device, mode: TestMode, options: &Options) -> Result<Vec<InCont
         pytest.extend(run.paths.iter().cloned());
     }
     pytest.extend(["--color=yes", "--tb=short", "-v"].map(str::to_owned));
+    // A cache for each device, so that the failures of every device are known after parallel
+    // runs and are not lost when another device runs.
+    let cache = format!("{APP_DIR}/{}", failures::cache_dir(device));
+    pytest.extend(["-o".to_owned(), format!("cache_dir={cache}")]);
     if options.verbose_tests {
         pytest.push("-s".to_owned());
     }
@@ -972,12 +1039,17 @@ mod tests {
             [
                 "bash",
                 "-c",
-                r#"[ ! -f "$1" ] || pip install -r "$1""#,
+                INSTALL_REQUIREMENTS_SCRIPT,
                 "_",
                 "tests/standalone/requirements.txt"
             ]
         );
         assert!(steps[0].continue_on_error && steps[0].venv);
+        assert_eq!(
+            steps[0].label.as_deref(),
+            Some("pip install -r tests/standalone/requirements.txt"),
+            "the log shows what it does, not the script"
+        );
         assert_eq!(
             steps[1].argv,
             [
@@ -986,6 +1058,8 @@ mod tests {
                 "--color=yes",
                 "--tb=short",
                 "-v",
+                "-o",
+                "cache_dir=/app/.pytest_cache/stax",
                 "--device",
                 "stax"
             ]
@@ -1016,6 +1090,33 @@ mod tests {
     }
 
     #[test]
+    fn each_device_keeps_its_own_pytest_cache() {
+        let plan = plan(
+            Task::RunTests(TestMode::Headless),
+            &c_app(),
+            &[Device::NanoSPlus, Device::Flex],
+            &tests_options(&[]),
+        );
+
+        let caches: Vec<String> = plan
+            .jobs
+            .iter()
+            .map(|job| {
+                let argv = &container(job.steps.last().unwrap()).argv;
+                let at = argv.iter().position(|arg| arg == "-o").unwrap();
+                argv[at + 1].clone()
+            })
+            .collect();
+        assert_eq!(
+            caches,
+            [
+                "cache_dir=/app/.pytest_cache/nanosp",
+                "cache_dir=/app/.pytest_cache/flex"
+            ]
+        );
+    }
+
+    #[test]
     fn the_test_mode_chooses_the_extra_pytest_flags() {
         let flags = |mode, verbose| {
             let options = Options {
@@ -1023,7 +1124,7 @@ mod tests {
                 ..tests_options(&[])
             };
             let plan = plan(Task::RunTests(mode), &c_app(), &[Device::Stax], &options);
-            container(plan.jobs[0].steps.last().unwrap()).argv[5..].to_vec()
+            container(plan.jobs[0].steps.last().unwrap()).argv[7..].to_vec()
         };
 
         assert_eq!(flags(TestMode::Headless, false), ["--device", "stax"]);
@@ -1347,5 +1448,251 @@ mod tests {
 
         assert_eq!(no_file.unwrap_err(), PlanError::NoComposeFile);
         assert_eq!(no_service.unwrap_err(), PlanError::NoComposeService);
+    }
+
+    #[cfg(unix)]
+    mod collect_script {
+        use std::os::unix::fs::PermissionsExt;
+        use std::path::{Path, PathBuf};
+        use std::process::Command as Process;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        use super::*;
+
+        /// A `pytest` that prints what a real one prints for `--help` and `--collect-only`.
+        fn fake_pytest(custom_options: &str, status: i32) -> PathBuf {
+            static NEXT: AtomicUsize = AtomicUsize::new(0);
+            let dir = std::env::temp_dir().join(format!(
+                "ledger-collect-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            ));
+            std::fs::create_dir_all(dir.join("bin")).unwrap();
+            std::fs::create_dir_all(dir.join("suite")).unwrap();
+            let script = format!(
+                "#!/bin/sh\n\
+                 case \"$1\" in\n\
+                 --help) printf 'usage: pytest\\n\\nCustom options:\\n{custom_options}\\n\\nother:\\n  --foo\\n' ;;\n\
+                 --collect-only) echo \"collected with: $*\"; echo 'test_a.py::test_x[stax]'; exit {status} ;;\n\
+                 esac\n"
+            );
+            let path = dir.join("bin").join("pytest");
+            std::fs::write(&path, script).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            dir
+        }
+
+        fn collect(dir: &Path) -> (i32, String) {
+            let path = format!(
+                "{}:{}",
+                dir.join("bin").display(),
+                std::env::var("PATH").unwrap()
+            );
+            let output = Process::new("bash")
+                .args(["-c", COLLECT_SCRIPT, "_"])
+                .arg(dir.join("suite"))
+                .arg("stax")
+                .env("PATH", path)
+                .output()
+                .unwrap();
+            (
+                output.status.code().unwrap(),
+                String::from_utf8(output.stdout).unwrap(),
+            )
+        }
+
+        #[test]
+        fn the_device_option_of_the_suite_gets_the_device() {
+            let dir = fake_pytest("  --device=DEVICE   the device", 0);
+            assert_eq!(
+                collect(&dir),
+                (
+                    0,
+                    "collected with: --collect-only -q --device stax\ntest_a.py::test_x[stax]\n"
+                        .to_owned()
+                )
+            );
+            std::fs::remove_dir_all(dir).unwrap();
+        }
+
+        #[test]
+        fn an_older_suite_that_calls_it_model_gets_the_device_as_its_model() {
+            let dir = fake_pytest("  --model {nanos,nanox}   the model", 0);
+            let (status, output) = collect(&dir);
+            assert_eq!(status, 0);
+            assert!(
+                output.contains("--collect-only -q --model stax"),
+                "{output}"
+            );
+            std::fs::remove_dir_all(dir).unwrap();
+        }
+
+        #[test]
+        fn a_suite_without_a_device_option_is_collected_as_it_is() {
+            let dir = fake_pytest("  --golden_run   regenerate", 0);
+            let (_, output) = collect(&dir);
+            assert!(
+                output.contains("collected with: --collect-only -q\n"),
+                "{output}"
+            );
+            std::fs::remove_dir_all(dir).unwrap();
+        }
+
+        #[test]
+        fn no_test_found_is_not_a_failure_but_a_real_failure_is() {
+            let none = fake_pytest("  --device=DEVICE   d1", 5);
+            let broken = fake_pytest("  --device=DEVICE   device two", 2);
+
+            assert_eq!(collect(&none).0, 0);
+            assert_eq!(collect(&broken).0, 2);
+            std::fs::remove_dir_all(none).unwrap();
+            std::fs::remove_dir_all(broken).unwrap();
+        }
+
+        #[test]
+        fn the_step_runs_the_script_in_the_python_environment_of_the_image() {
+            let step = collect_tests("./tests/swap", Device::Flex);
+
+            assert!(step.venv);
+            assert_eq!(step.argv[..2], ["bash", "-c"]);
+            assert_eq!(step.argv[3..], ["_", "./tests/swap", "flex"]);
+        }
+    }
+
+    #[cfg(unix)]
+    mod install_script {
+        use std::os::unix::fs::PermissionsExt;
+        use std::path::{Path, PathBuf};
+        use std::process::{Child, Command as Process, Stdio};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        use super::*;
+
+        /// A directory with a `pip` that records when it starts and ends, and a pip cache.
+        struct Sandbox {
+            dir: PathBuf,
+        }
+
+        impl Sandbox {
+            fn new() -> Self {
+                static NEXT: AtomicUsize = AtomicUsize::new(0);
+                let dir = std::env::temp_dir().join(format!(
+                    "ledger-install-{}-{}",
+                    std::process::id(),
+                    NEXT.fetch_add(1, Ordering::Relaxed)
+                ));
+                std::fs::create_dir_all(dir.join("bin")).unwrap();
+                std::fs::create_dir_all(dir.join("cache")).unwrap();
+                let pip = dir.join("bin").join("pip");
+                std::fs::write(
+                    &pip,
+                    "#!/bin/sh\necho \"start $$\" >> \"$FAKE_PIP_LOG\"\nsleep 0.4\necho \"end $$\" >> \"$FAKE_PIP_LOG\"\necho \"pip $*\"\n",
+                )
+                .unwrap();
+                std::fs::set_permissions(&pip, std::fs::Permissions::from_mode(0o755)).unwrap();
+                std::fs::write(dir.join("requirements.txt"), "pytest\n").unwrap();
+                Self { dir }
+            }
+
+            fn start(&self, requirements: &Path, cache: &Path) -> Child {
+                let path = format!(
+                    "{}:{}",
+                    self.dir.join("bin").display(),
+                    std::env::var("PATH").unwrap()
+                );
+                Process::new("bash")
+                    .args(["-c", INSTALL_REQUIREMENTS_SCRIPT, "_"])
+                    .arg(requirements)
+                    .env("PATH", path)
+                    .env("PIP_CACHE_DIR", cache)
+                    .env("FAKE_PIP_LOG", self.dir.join("pip.log"))
+                    .stdout(Stdio::piped())
+                    .spawn()
+                    .unwrap()
+            }
+
+            fn log(&self) -> Vec<String> {
+                std::fs::read_to_string(self.dir.join("pip.log"))
+                    .unwrap_or_default()
+                    .lines()
+                    .map(|line| line.split(' ').next().unwrap().to_owned())
+                    .collect()
+            }
+
+            fn finish(self) {
+                std::fs::remove_dir_all(self.dir).unwrap();
+            }
+        }
+
+        fn output(child: Child) -> String {
+            let output = child.wait_with_output().unwrap();
+            assert!(output.status.success());
+            String::from_utf8(output.stdout).unwrap()
+        }
+
+        #[test]
+        fn the_requirements_file_is_installed() {
+            let sandbox = Sandbox::new();
+
+            let printed = output(sandbox.start(
+                &sandbox.dir.join("requirements.txt"),
+                &sandbox.dir.join("cache"),
+            ));
+
+            assert!(printed.contains("pip install -r"), "{printed}");
+            assert_eq!(sandbox.log(), ["start", "end"]);
+            sandbox.finish();
+        }
+
+        #[test]
+        fn a_suite_without_requirements_installs_nothing_and_succeeds() {
+            let sandbox = Sandbox::new();
+
+            let printed =
+                output(sandbox.start(&sandbox.dir.join("none.txt"), &sandbox.dir.join("cache")));
+
+            assert_eq!(printed, "");
+            assert!(sandbox.log().is_empty());
+            sandbox.finish();
+        }
+
+        #[test]
+        fn containers_install_one_after_the_other_and_the_one_that_waits_says_so() {
+            let sandbox = Sandbox::new();
+            let requirements = sandbox.dir.join("requirements.txt");
+            let cache = sandbox.dir.join("cache");
+
+            let first = sandbox.start(&requirements, &cache);
+            let second = sandbox.start(&requirements, &cache);
+            let printed = [output(first), output(second)];
+
+            let log = sandbox.log();
+            assert_eq!(log.len(), 4, "{log:?}");
+            assert_eq!(
+                log,
+                ["start", "end", "start", "end"],
+                "never at the same time"
+            );
+            let waiting = printed
+                .iter()
+                .filter(|text| text.contains("Waiting for another container"))
+                .count();
+            assert_eq!(waiting, 1, "{printed:?}");
+            sandbox.finish();
+        }
+
+        #[test]
+        fn without_a_pip_cache_to_write_to_it_installs_without_a_lock() {
+            let sandbox = Sandbox::new();
+
+            let printed = output(sandbox.start(
+                &sandbox.dir.join("requirements.txt"),
+                &sandbox.dir.join("no-such-cache"),
+            ));
+
+            assert!(printed.contains("pip install -r"), "{printed}");
+            assert_eq!(sandbox.log(), ["start", "end"]);
+            sandbox.finish();
+        }
     }
 }

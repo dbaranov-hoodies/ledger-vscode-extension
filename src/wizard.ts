@@ -2,8 +2,6 @@ import * as vscode from "vscode";
 import * as fs from "fs";
 import * as path from "path";
 import { simpleGit } from "simple-git";
-import { getAppList } from "./appSelector";
-import { Webview } from "./webview/webviewProvider";
 
 /**
  * Manages the app creation wizard and post-creation walkthroughs.
@@ -11,7 +9,8 @@ import { Webview } from "./webview/webviewProvider";
 export class Wizard {
   private context: vscode.ExtensionContext;
   private _startupCheckDone = false;
-  constructor(context: vscode.ExtensionContext, mainView: Webview) {
+  /** `firstSnapshot` is what the sidecar tells first, once it has looked for the apps. */
+  constructor(context: vscode.ExtensionContext, firstSnapshot: Promise<{ apps: unknown[] }>) {
     this.context = context;
 
     // Register commands for creating Rust apps, used for onboarding walkthrough buttons
@@ -29,20 +28,16 @@ export class Wizard {
       this.suppressStartupEditor(false);
     }
 
-    // When the webview is ready, open the onboarding walkthrough if no apps are found.
-    context.subscriptions.push(
-      mainView.onWebviewReadyEvent(async () => {
-        if (this._startupCheckDone) {
-          return;
-        }
-        this._startupCheckDone = true;
-
-        const appList = getAppList();
-        if (!appList || appList.length === 0) {
-          vscode.commands.executeCommand("workbench.action.openWalkthrough", "LedgerHQ.ledger-dev-tools#ledgerOnboarding", false);
-        }
-      }),
-    );
+    // Once the apps were looked for, open the onboarding walkthrough if there are none.
+    firstSnapshot.then((snapshot) => {
+      if (this._startupCheckDone) {
+        return;
+      }
+      this._startupCheckDone = true;
+      if (snapshot.apps.length === 0) {
+        vscode.commands.executeCommand("workbench.action.openWalkthrough", "LedgerHQ.ledger-dev-tools#ledgerOnboarding", false);
+      }
+    });
   }
 
   /**
@@ -102,7 +97,7 @@ export class Wizard {
       // when it reopens with the new folder.
       await vscode.commands.executeCommand("workbench.action.closeAllEditors");
       // Suppress VS Code's default Getting Started page so our custom walkthrough
-      // can open uncontested. Removed on the next startup by the webview ready handler.
+      // can open uncontested. Removed on the next startup, when the walkthrough opens.
       this.suppressStartupEditor(true, fullPath);
       vscode.commands.executeCommand("vscode.openFolder", vscode.Uri.file(fullPath), { forceNewWindow: false });
     }

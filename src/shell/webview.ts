@@ -11,7 +11,6 @@ export interface WebviewRequest {
 interface UiState {
   pinned: string[];
   expanded: string[];
-  showActions: boolean;
 }
 
 /** The panel of the extension. It shows the last snapshot, and sends back what the user does. */
@@ -70,7 +69,6 @@ export class ShellWebview implements vscode.WebviewViewProvider {
     const uiState: UiState = {
       pinned: state.get<string[]>("pinnedActions", []),
       expanded: state.get<string[]>("expandedGroups", []),
-      showActions: state.get<boolean>("showActions", true),
     };
     this.view?.webview.postMessage({ type: "uiState", ...uiState });
   }
@@ -79,7 +77,6 @@ export class ShellWebview implements vscode.WebviewViewProvider {
     const state = this.context.globalState;
     state.update("pinnedActions", uiState.pinned ?? []);
     state.update("expandedGroups", uiState.expanded ?? []);
-    state.update("showActions", uiState.showActions ?? true);
   }
 
   private html(webview: vscode.Webview): string {
@@ -95,7 +92,6 @@ export class ShellWebview implements vscode.WebviewViewProvider {
       </head>
       <body>
         <script>
-          window.uiMode = "snapshot";
           window.resourceUris = { wordmark: "${asUri("resources", "ledger-wordmark-transparent.png")}" };
         </script>
         <script src="${asUri("dist", "webview.js")}"></script>

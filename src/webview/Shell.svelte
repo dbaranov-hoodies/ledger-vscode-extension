@@ -1,8 +1,10 @@
 <script lang="ts">
   import "@vscode-elements/elements/dist/vscode-icon/index.js";
   import autoAnimate from "@formkit/auto-animate";
-  import { ChevronDown, ChevronRight } from "@jis3r/icons";
+  import { Popover } from "bits-ui";
   import Select, { type SelectItem } from "./components/Select.svelte";
+  import DeviceSelect from "./components/DeviceSelect.svelte";
+  import TestTree from "./components/TestTree.svelte";
   import StatusDot from "./components/StatusDot.svelte";
   import ActionGroup from "./components/ActionGroup.svelte";
   import Toolbar from "./components/Toolbar.svelte";
@@ -21,7 +23,6 @@
   let snapshot = $state<Snapshot | null>(null);
   let pinned = $state<string[]>([]);
   let expanded = $state<string[]>([]);
-  let showActions = $state(true);
   // The result of an action, shown for a few seconds once it is over.
   let results = $state<Record<string, CommandStatus>>({});
 
@@ -29,24 +30,14 @@
   const apps = $derived<SelectItem[]>(
     (snapshot?.apps ?? []).map((summary) => ({ value: summary.folder, label: summary.name })),
   );
-  const allDevices = "All";
-
-  const deviceItems = $derived<SelectItem[]>([
-    ...((app?.devices.available.length ?? 0) > 1 ? [{ value: allDevices, label: allDevices }] : []),
-    ...(app?.devices.available ?? []).map((device) => ({ value: device.id, label: device.name })),
-  ]);
-  const selectedDevice = $derived(
-    app?.devices.all
-      ? allDevices
-      : app?.devices.selected.length === 1
-        ? app.devices.selected[0]
-        : "",
-  );
   const buildUseCases = $derived<SelectItem[]>(
     (app?.buildUseCases.items ?? []).map((name) => ({ value: name, label: name })),
   );
   const variants = $derived<SelectItem[]>(
     (app?.variants?.items ?? []).map((name) => ({ value: name, label: name })),
+  );
+  const aiModels = $derived<SelectItem[]>(
+    (app?.aiModels.items ?? []).map((name) => ({ value: name, label: name })),
   );
   const enforcerChecks = $derived<SelectItem[]>(
     (app?.enforcerChecks.items ?? []).map((name) => ({ value: name, label: name })),
@@ -57,6 +48,7 @@
     deviceActionsOff: "Actions on a Nano X are turned off in the settings",
     noComposeFile: "The app has no docker-compose.yml",
     noTestSuite: "The app has no test suite",
+    noTestSelected: "Select at least one test",
     noAiModel: "No AI model is available",
   };
 
@@ -85,8 +77,11 @@
     })),
   );
 
+  // A group is greyed out when its main action cannot run. With no test chosen it stays open:
+  // the tests are chosen in it, and only the button that runs them is disabled.
   function isGroupDisabled(group: ActionGroupData): boolean {
-    return !!group.mainAction && group.mainAction.disabled;
+    const main = app?.groups.find((view) => view.group === group.id)?.main;
+    return !!main && !main.enabled && main.disabledReason !== "noTestSelected";
   }
 
   function request(method: string, params: object = {}) {
@@ -102,12 +97,15 @@
       type: "saveUiState",
       pinned: [...pinned],
       expanded: [...expanded],
-      showActions,
     });
   }
 
+  // Clicking an action that runs stops it.
   function run(actionId: string) {
-    request("runAction", { id: actionId });
+    const running = (app?.groups ?? [])
+      .flatMap((group) => [group.main, ...group.options])
+      .some((action) => action?.id === actionId && action.running);
+    request(running ? "cancelAction" : "runAction", { id: actionId });
   }
 
   function togglePin(actionId: string) {
@@ -124,15 +122,16 @@
     saveUiState();
   }
 
-  function toggleActions() {
-    showActions = !showActions;
-    saveUiState();
-  }
+  // What the user chose to type for the tests of this app, to install what they need.
+  let requirementsOpen = $state(false);
+  let requirementsInput = $state("");
+  $effect(() => {
+    requirementsInput = app?.testRequirements ?? "";
+  });
 
-  function selectDevice(value: string) {
-    const devices =
-      value === allDevices ? (app?.devices.available ?? []).map((d) => d.id) : [value];
-    request("setDevices", { devices });
+  function saveRequirements() {
+    request("setTestRequirements", { text: requirementsInput });
+    requirementsOpen = false;
   }
 
   // The status dot asks for the update the way the former panel did.
@@ -153,7 +152,6 @@
       case "uiState":
         pinned = message.pinned ?? [];
         expanded = message.expanded ?? [];
-        showActions = message.showActions ?? true;
         break;
       case "actionFinished":
         results[message.id] = message.success ? "success" : "error";
@@ -245,13 +243,13 @@
               />
             </div>
             <div class="form-group">
-              <Select
+              <DeviceSelect
                 icon="device-mobile"
                 groupLabel="Device"
-                items={deviceItems}
-                value={selectedDevice}
-                placeholder={app.devices.label}
-                onchange={selectDevice}
+                devices={app.devices.available}
+                selected={app.devices.selected}
+                label={app.devices.label}
+                onchange={(devices: string[]) => request("setDevices", { devices })}
               />
             </div>
             {#if buildUseCases.length > 1}
@@ -293,43 +291,95 @@
         </div>
       </div>
 
-      <button class="actions-toggle" onclick={toggleActions}>
-        {#if showActions}
-          <ChevronDown size={12} />
-        {:else}
-          <ChevronRight size={12} />
-        {/if}
-        <span>Actions</span>
-      </button>
-
-      <div class="actions-wrapper" use:autoAnimate>
-        {#if showActions}
-          <div class="actions-section">
-            {#each actionGroups as group (group.id)}
-              <ActionGroup
-                {group}
-                disabled={isGroupDisabled(group)}
-                allDevices={false}
-                onExecute={run}
-                onTogglePin={togglePin}
-                onToggleExpand={() => toggleExpand(group.id)}
-              >
-                {#snippet optionSuffix(option)}
-                  {#if option.id === "Enforcer Checks"}
-                    <div class="check-select-wrapper">
-                      <Select
-                        items={enforcerChecks}
-                        value={app.enforcerChecks.selected ?? ""}
-                        placeholder="All"
-                        onchange={(name: string) => request("setEnforcerCheck", { name })}
-                      />
-                    </div>
-                  {/if}
-                {/snippet}
-              </ActionGroup>
-            {/each}
-          </div>
-        {/if}
+      <div class="actions-section">
+        {#each actionGroups as group (group.id)}
+          <ActionGroup
+            {group}
+            disabled={isGroupDisabled(group)}
+            allDevices={false}
+            onExecute={run}
+            onTogglePin={togglePin}
+            onToggleExpand={() => toggleExpand(group.id)}
+          >
+            {#if group.id === "Tests"}
+              <div class="option-row">
+                <Popover.Root bind:open={requirementsOpen}>
+                  <Popover.Trigger openOnHover openDelay={1000} class="option-button">
+                    <span class="option-icon">
+                      <i class="codicon codicon-type-hierarchy"></i>
+                    </span>
+                    <span class="option-label">Add Test Dependencies</span>
+                  </Popover.Trigger>
+                  <Popover.Portal>
+                    <Popover.Content class="deps-popover" side="top" sideOffset={4}>
+                      <div class="deps-popover-content">
+                        <label class="deps-label" for="deps-input">
+                          Additional test dependencies
+                        </label>
+                        <div class="dep-warning-row">
+                          <i class="codicon codicon-warning"></i>
+                          <button
+                            class="dep-warning-link"
+                            onclick={() =>
+                              command("workbench.action.openSettings", [
+                                "ledgerDevTools.openContainerAsRoot",
+                              ])}
+                          >
+                            Enable root on container
+                          </button>
+                        </div>
+                        <input
+                          id="deps-input"
+                          type="text"
+                          class="deps-input"
+                          bind:value={requirementsInput}
+                          placeholder="e.g. apt install package_name"
+                        />
+                        <button class="deps-save-button" onclick={saveRequirements}>
+                          Save
+                        </button>
+                      </div>
+                    </Popover.Content>
+                  </Popover.Portal>
+                </Popover.Root>
+              </div>
+              {#if app.tests.suite}
+                <TestTree
+                  tests={app.tests}
+                  devices={app.devices}
+                  refresh={() => request("collectTests")}
+                  toggle={(id: string) => request("toggleTest", { id })}
+                  choose={(ids: string[] | null) => request("setTests", { ids })}
+                  selectFailed={() => request("selectFailedTests")}
+                  open={(id: string) => request("openTest", { id })}
+                  chooseSuite={(name: string) => request("setTestSuite", { name })}
+                  setVerbose={(value: boolean) => request("setVerboseTests", { value })}
+                />
+              {/if}
+            {/if}
+            {#snippet optionSuffix(option)}
+              {#if option.id === "Enforcer Checks"}
+                <div class="check-select-wrapper">
+                  <Select
+                    items={enforcerChecks}
+                    value={app.enforcerChecks.selected ?? ""}
+                    placeholder="All"
+                    onchange={(name: string) => request("setEnforcerCheck", { name })}
+                  />
+                </div>
+              {:else if option.id === "AI Review" && aiModels.length > 1}
+                <div class="check-select-wrapper">
+                  <Select
+                    items={aiModels}
+                    value={app.aiModels.selected ?? ""}
+                    placeholder="Select AI Model"
+                    onchange={(name: string) => request("setAiModel", { name })}
+                  />
+                </div>
+              {/if}
+            {/snippet}
+          </ActionGroup>
+        {/each}
       </div>
     </div>
   {/if}
@@ -484,14 +534,109 @@
     color: var(--vscode-editorWarning-foreground);
   }
 
-  .actions-toggle:hover {
-    color: var(--vscode-foreground);
-    opacity: 1;
-  }
-
   .check-select-wrapper {
     flex: 50%;
     max-width: 200px;
     min-width: 0;
+  }
+
+  .dep-warning-row {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    color: var(--vscode-editorWarning-foreground);
+    font-size: 11px;
+  }
+
+  .dep-warning-link {
+    background: none;
+    border: none;
+    padding: 0;
+    color: var(--vscode-editorWarning-foreground);
+    font-size: 11px;
+    cursor: pointer;
+    text-decoration: underline;
+  }
+
+  .dep-warning-link:hover {
+    opacity: 0.8;
+  }
+
+  :global(.option-button) {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 4px 8px;
+    border: none;
+    border-radius: 2px;
+    background-color: transparent;
+    color: var(--vscode-foreground);
+    cursor: pointer;
+    transition: all 0.1s;
+    text-align: left;
+    flex: 1;
+  }
+
+  :global(.option-button:hover) {
+    background-color: var(--vscode-list-hoverBackground);
+  }
+
+  .option-icon {
+    font-size: 14px;
+    color: var(--vscode-descriptionForeground);
+  }
+
+  .option-label {
+    flex: 1;
+    font-size: 12px;
+  }
+
+  :global(.deps-popover) {
+    background-color: var(--vscode-editorWidget-background);
+    border: 1px solid var(--vscode-editorWidget-border);
+    border-radius: 4px;
+    padding: 12px;
+    box-shadow: 0 2px 8px var(--vscode-widget-shadow);
+    z-index: 1000;
+  }
+
+  :global(.deps-popover-content) {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    min-width: 220px;
+  }
+
+  :global(.deps-label) {
+    font-size: 11px;
+    color: var(--vscode-descriptionForeground);
+  }
+
+  :global(.deps-input) {
+    padding: 4px 8px;
+    font-size: 12px;
+    background-color: var(--vscode-input-background);
+    color: var(--vscode-input-foreground);
+    border: 1px solid var(--vscode-input-border);
+    border-radius: 2px;
+    outline: none;
+  }
+
+  :global(.deps-input:focus) {
+    border-color: var(--vscode-focusBorder);
+  }
+
+  :global(.deps-save-button) {
+    padding: 4px 10px;
+    font-size: 12px;
+    background-color: var(--vscode-button-background);
+    color: var(--vscode-button-foreground);
+    border: none;
+    border-radius: 2px;
+    cursor: pointer;
+  }
+
+  :global(.deps-save-button:hover) {
+    background-color: var(--vscode-button-hoverBackground);
   }
 </style>

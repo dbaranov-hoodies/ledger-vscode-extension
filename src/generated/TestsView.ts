@@ -3,6 +3,10 @@ import type { TestNodeView } from "./TestNodeView";
 
 export type TestsView = { suites: Array<string>, suite: string | null, 
 /**
+ * Where the selected suite is, relative to the app folder.
+ */
+directory: string | null, 
+/**
  * Empty until the tests were collected.
  */
 tree: Array<TestNodeView>, collecting: boolean, verbose: boolean, };

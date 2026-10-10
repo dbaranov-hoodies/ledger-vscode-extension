@@ -1,18 +1,20 @@
 use std::sync::Mutex;
+use std::time::Duration;
 
 use ledger_core::Command;
 use ledger_core::Device;
 use ledger_core::actions::ContainerAction;
 use ledger_core::c_app::{self, MakefileInfo};
 use ledger_core::container::{
-    self, ContainerState, Observation, ObservedContainer, Operation, Plan, Retries, Retry,
-    Settings, Status,
+    self, ContainerState, Inspected, Observation, ObservedContainer, Operation, Plan, Retries,
+    Retry, Settings, Status,
 };
 use ledger_core::docker::{self, ContainerUser, CreateContainer, RunId, RunMake};
 use ledger_core::platform::Platform;
-use ledger_core::task::{self, Job, Step};
+use ledger_core::task::{self, InContainer, Job, Step};
 use ledger_core::update::{self, CheckPolicy, Freshness, LastCheck};
 
+use crate::cancel::CancelToken;
 use crate::log::{Log, LogSender, Source};
 use crate::runner::{CommandRunner, Output, new_run_id};
 use crate::runs::ActiveRuns;
@@ -47,6 +49,8 @@ pub enum Outcome {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum JobOutcome {
     Succeeded,
+    /// The run was cancelled, and what it had started in the container was stopped.
+    Cancelled,
     /// A step failed, counting from 0, and the job stopped there.
     Failed {
         step: usize,
@@ -178,19 +182,26 @@ impl<R: CommandRunner> ContainerManager<R> {
             .map(|output| output.stdout.trim().to_owned())
             .filter(|id| !id.is_empty());
 
+        let pip_cache = docker::pip_cache_volume(self.config.user);
         let mut containers = Vec::with_capacity(devices.len());
         for &device in devices {
             let inspected = self
                 .run(&docker::container_status(&self.container_name(device)))
                 .await;
-            let (state, image_id) = match inspected {
+            let inspected = match inspected {
                 Some(output) if output.success => container::parse_inspect(&output.stdout),
-                _ => (ContainerState::Missing, None),
+                _ => Inspected {
+                    state: ContainerState::Missing,
+                    image_id: None,
+                    pip_cache: None,
+                },
             };
             containers.push(ObservedContainer {
                 device,
-                state,
-                image_id,
+                state: inspected.state,
+                image_id: inspected.image_id,
+                pip_cache_ready: inspected.state == ContainerState::Missing
+                    || inspected.pip_cache.as_deref() == Some(pip_cache.as_str()),
                 busy: self.runs.is_busy(device),
             });
         }
@@ -333,11 +344,20 @@ impl<R: CommandRunner> ContainerManager<R> {
             self.run_checked(source.clone(), &docker::remove(&name))
                 .await?;
         }
+        // The containers of the user share one cache of what pip downloads and builds. Docker makes
+        // its volume as root's, so the user is given it first: pip does not write to anything else.
+        let pip_cache = docker::pip_cache_volume(self.config.user);
+        self.run_in(source.clone(), &docker::create_volume(&pip_cache))
+            .await;
+        if let Some(own) = docker::own_pip_cache(&self.config.image, &pip_cache, self.config.user) {
+            self.run_in(source.clone(), &own).await;
+        }
         let create = docker::create_container(&CreateContainer {
             name: &name,
             image: &self.config.image,
             app_dir: &self.config.app_dir,
             user: self.config.user,
+            pip_cache: &pip_cache,
             extra_args: &self.config.extra_args,
             platform: self.config.platform,
             display: self.config.display.as_deref(),
@@ -377,16 +397,27 @@ impl<R: CommandRunner> ContainerManager<R> {
 
     /// Runs the jobs of a plan side by side, each in the container of its device. The processes
     /// of a job are tagged and stopped when it ends, so nothing is left running in the container.
-    /// To stop a job early, use [`ContainerManager::cancel`].
     pub async fn run_plan(&self, plan: &task::Plan) -> Vec<JobResult> {
-        futures_util::future::join_all(plan.jobs.iter().map(|job| self.run_job(job))).await
+        self.run_plan_until(plan, &CancelToken::new()).await
     }
 
-    async fn run_job(&self, job: &Job) -> JobResult {
+    /// Like [`ContainerManager::run_plan`], and every job stops when `cancel` is cancelled: what
+    /// runs on the host is killed, and so is what it started in the container.
+    pub async fn run_plan_until(&self, plan: &task::Plan, cancel: &CancelToken) -> Vec<JobResult> {
+        futures_util::future::join_all(plan.jobs.iter().map(|job| self.run_job(job, cancel))).await
+    }
+
+    async fn run_job(&self, job: &Job, cancel: &CancelToken) -> JobResult {
         let run_id = new_run_id();
         let in_container = job.uses_container();
         let _active = in_container.then(|| self.runs.begin(job.device, run_id.clone()));
-        let outcome = self.run_steps(job, &run_id).await;
+        // Dropping the steps kills their clients. The cleanup below runs either way, and it is
+        // what stops the processes in the container.
+        let outcome = tokio::select! {
+            biased;
+            () = cancel.cancelled() => JobOutcome::Cancelled,
+            outcome = self.run_steps(job, &run_id) => outcome,
+        };
         if in_container {
             self.kill_run(job.device, &run_id).await;
         }
@@ -457,6 +488,29 @@ impl<R: CommandRunner> ContainerManager<R> {
         Ok(output.stdout)
     }
 
+    /// Runs a step in the container of `device` and returns what it printed. It is a question, so
+    /// it is not logged, and the processes it started are stopped when it ends.
+    pub async fn capture(
+        &self,
+        device: Device,
+        step: &InContainer,
+        timeout: Duration,
+    ) -> Result<String, String> {
+        let run_id = new_run_id();
+        let _active = self.runs.begin(device, run_id.clone());
+        let command = step
+            .command(&self.container_name(device), self.config.user, &run_id)
+            .timeout(timeout);
+        let result = self.runner.run(&command, None).await;
+        self.kill_run(device, &run_id).await;
+        let output = result.map_err(|error| format!("{command}: {error}"))?;
+        if output.success {
+            Ok(output.stdout)
+        } else {
+            Err(format!("{command}: {}", last_lines(&output, 12)))
+        }
+    }
+
     /// Whether the registry has a newer image than the local one. `None` when either digest is
     /// unknown, for example when offline.
     pub async fn image_outdated(&self) -> Option<bool> {
@@ -472,6 +526,16 @@ impl<R: CommandRunner> ContainerManager<R> {
         let remote = docker::parse_remote_digest(&remote.stdout)?;
         Some(local != remote)
     }
+}
+
+/// The end of what a command printed, where its error usually is.
+fn last_lines(output: &Output, count: usize) -> String {
+    let text = format!("{}\n{}", output.stdout, output.stderr);
+    let lines: Vec<&str> = text
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .collect();
+    lines[lines.len().saturating_sub(count)..].join("\n")
 }
 
 #[cfg(test)]
@@ -654,7 +718,7 @@ mod tests {
         assert_eq!(outcome, Outcome::Settled(Status::Running));
         assert_eq!(count(&docker, "docker pull"), 0);
         assert_eq!(count(&docker, "xhost"), 1);
-        assert_eq!(count(&docker, "docker run"), 1);
+        assert_eq!(count(&docker, "docker run --init"), 1);
         assert_eq!(docker.container_status(STAX), Some("running"));
     }
 
@@ -782,11 +846,13 @@ mod tests {
         for (device, own, other) in [(Device::Stax, STAX, FLEX), (Device::Flex, FLEX, STAX)] {
             let source = Source::Container(device);
             let commands = started(&events, &source);
-            assert_eq!(commands.len(), 2, "{commands:?}");
+            assert_eq!(commands.len(), 4, "{commands:?}");
             assert_eq!(commands[0], "xhost +");
-            assert!(commands[1].starts_with("docker run"));
-            assert!(commands[1].contains(own) && !commands[1].contains(other));
-            assert_eq!(finished(&events, &source), [true, true]);
+            assert!(commands[1].starts_with("docker volume create"));
+            assert!(commands[2].contains("chown"));
+            assert!(commands[3].starts_with("docker run --init"));
+            assert!(commands[3].contains(own) && !commands[3].contains(other));
+            assert_eq!(finished(&events, &source), [true; 4]);
         }
         assert!(started(&events, &Source::Image).is_empty());
     }
@@ -862,7 +928,7 @@ mod tests {
         assert_eq!(outcome, Outcome::Settled(Status::Running));
         assert_eq!(count(&docker, "docker pull"), 1);
         assert!(position(&docker, "docker pull") < position(&docker, "docker stop"));
-        assert_eq!(count(&docker, "docker run"), 2);
+        assert_eq!(count(&docker, "docker run --init"), 2);
         assert_eq!(
             docker.container_image(STAX).as_deref(),
             Some("sha256:image2")
@@ -982,7 +1048,7 @@ mod tests {
         assert_eq!(count(&docker, "docker pull"), 1);
         assert_eq!(count(&docker, "docker stop"), 0);
         assert_eq!(count(&docker, "docker rm"), 0);
-        assert_eq!(count(&docker, "docker run"), 0);
+        assert_eq!(count(&docker, "docker run --init"), 0);
         assert_eq!(
             docker.container_image(STAX).as_deref(),
             Some("sha256:image1")
@@ -1009,7 +1075,7 @@ mod tests {
             .await;
 
         assert_eq!(count(&docker, "docker pull"), 0);
-        assert_eq!(count(&docker, "docker run"), 1);
+        assert_eq!(count(&docker, "docker run --init"), 1);
         assert_eq!(
             docker.container_image(STAX).as_deref(),
             Some(crate::fake::FIRST_IMAGE)
@@ -1369,7 +1435,7 @@ mod tests {
         assert_eq!(result, Ok(()));
         assert!(position(&docker, "docker pull") < position(&docker, "docker run"));
         assert_eq!(count(&docker, "docker pull"), 1);
-        assert_eq!(count(&docker, "docker run"), 2);
+        assert_eq!(count(&docker, "docker run --init"), 2);
         assert_eq!(
             docker.container_image(STAX).as_deref(),
             Some("sha256:image2")
@@ -1391,7 +1457,7 @@ mod tests {
 
         assert_eq!(result, Ok(()));
         assert_eq!(count(&docker, "docker pull"), 0);
-        assert_eq!(count(&docker, "docker run"), 1);
+        assert_eq!(count(&docker, "docker run --init"), 1);
         assert_eq!(docker.container_status(STAX), Some("running"));
     }
 
@@ -1439,7 +1505,7 @@ mod tests {
             .await;
 
         assert_eq!(result, Ok(()));
-        assert_eq!(count(&docker, "docker run"), 1, "only the idle one");
+        assert_eq!(count(&docker, "docker run --init"), 1, "only the idle one");
         let notes: Vec<_> = drain(&mut receiver)
             .into_iter()
             .filter_map(|event| match event {
@@ -1454,5 +1520,171 @@ mod tests {
                 "not replaced: a run is active in this container".to_owned()
             )]
         );
+    }
+
+    fn collect_step() -> InContainer {
+        task::collect_tests("./tests", Device::Stax)
+    }
+
+    #[tokio::test]
+    async fn a_step_in_a_container_answers_with_what_it_printed_and_leaves_nothing_behind() {
+        let docker = FakeDocker::new().with_exec_output("--collect-only", "test_a.py::test_x\n");
+        let (sender, mut receiver) = log::channel();
+        let manager = ContainerManager::new(&docker, config()).with_logs(sender);
+
+        let output = manager
+            .capture(Device::Stax, &collect_step(), Duration::from_secs(5))
+            .await;
+
+        assert_eq!(output, Ok("test_a.py::test_x\n".to_owned()));
+        assert!(drain(&mut receiver).is_empty(), "a question is not logged");
+        let calls = docker.calls();
+        assert_eq!(calls.len(), 2, "the step, then the cleanup: {calls:?}");
+        assert!(calls[1].contains("docker exec --user 0"), "{calls:?}");
+        assert!(!manager.runs().is_busy(Device::Stax));
+    }
+
+    #[tokio::test]
+    async fn a_failing_step_answers_with_the_end_of_its_output() {
+        let docker = FakeDocker::new().fail("--collect-only", 1);
+        let manager = ContainerManager::new(&docker, config());
+
+        let error = manager
+            .capture(Device::Stax, &collect_step(), Duration::from_secs(5))
+            .await
+            .unwrap_err();
+
+        assert!(error.contains("injected failure"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_plan_starts_nothing_and_cleans_up_the_container() {
+        let docker = FakeDocker::new();
+        let manager = ContainerManager::new(&docker, config());
+        let plan = plan_for(
+            Task::BuildApp,
+            &[Device::Stax, Device::Flex],
+            &Options::default(),
+        );
+        let cancel = CancelToken::new();
+        cancel.cancel();
+
+        let results = manager.run_plan_until(&plan, &cancel).await;
+
+        assert!(
+            results
+                .iter()
+                .all(|result| result.outcome == JobOutcome::Cancelled)
+        );
+        let calls = docker.calls();
+        assert_eq!(
+            calls.len(),
+            2,
+            "only the cleanup of each container: {calls:?}"
+        );
+        assert!(
+            calls
+                .iter()
+                .all(|call| call.contains("docker exec --user 0")),
+            "{calls:?}"
+        );
+        assert!(!manager.runs().is_busy(Device::Stax));
+    }
+
+    #[tokio::test]
+    async fn a_host_job_that_is_cancelled_has_nothing_to_clean_up_in_a_container() {
+        let docker = FakeDocker::new();
+        let manager = ContainerManager::new(&docker, config());
+        let plan = host_plan(&[&["python3", "-V"]]);
+        let cancel = CancelToken::new();
+        cancel.cancel();
+
+        let results = manager.run_plan_until(&plan, &cancel).await;
+
+        assert_eq!(results[0].outcome, JobOutcome::Cancelled);
+        assert!(docker.calls().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_plan_that_is_not_cancelled_runs_to_its_end() {
+        let docker = FakeDocker::new();
+        let manager = ContainerManager::new(&docker, config());
+        let plan = plan_for(Task::BuildApp, &[Device::Stax], &Options::default());
+
+        let results = manager.run_plan_until(&plan, &CancelToken::new()).await;
+
+        assert_eq!(results[0].outcome, JobOutcome::Succeeded);
+    }
+
+    const STAX_CACHE: &str = "ledger-pip-cache-1000";
+
+    #[tokio::test]
+    async fn a_container_gets_the_pip_cache_of_its_user_which_is_given_to_that_user_first() {
+        let docker = FakeDocker::new();
+        let manager = ContainerManager::new(&docker, config());
+
+        manager.ensure_ready(&[Device::Stax], NOW).await;
+
+        assert_eq!(docker.volumes(), [STAX_CACHE]);
+        assert!(
+            position(&docker, "docker volume create") < position(&docker, "docker run --rm"),
+            "the volume exists before it is given away"
+        );
+        assert!(
+            position(&docker, "docker run --rm") < position(&docker, "docker run --init"),
+            "the user owns it before the container uses it"
+        );
+        assert_eq!(docker.container_cache(STAX).as_deref(), Some(STAX_CACHE));
+    }
+
+    #[tokio::test]
+    async fn root_has_the_original_cache_and_nothing_to_give_away() {
+        let docker = FakeDocker::new();
+        let config = Config {
+            user: ContainerUser::Root,
+            ..config()
+        };
+        let manager = ContainerManager::new(&docker, config);
+
+        manager.ensure_ready(&[Device::Stax], NOW).await;
+
+        assert_eq!(docker.volumes(), ["ledger-pip-cache"]);
+        assert_eq!(count(&docker, "docker run --rm"), 0);
+        assert_eq!(
+            docker.container_cache(STAX).as_deref(),
+            Some("ledger-pip-cache")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_container_that_mounts_the_old_cache_is_replaced_with_auto_update_and_kept_without() {
+        let old = || FakeDocker::new().with_container_cache(STAX, "running", "ledger-pip-cache");
+        let (kept, replaced) = (old(), old());
+
+        ContainerManager::new(&kept, config())
+            .ensure_ready(&[Device::Stax], NOW)
+            .await;
+        ContainerManager::new(&replaced, auto())
+            .ensure_ready(&[Device::Stax], NOW)
+            .await;
+
+        assert_eq!(count(&kept, "docker rm"), 0, "never without auto update");
+        assert_eq!(
+            kept.container_cache(STAX).as_deref(),
+            Some("ledger-pip-cache")
+        );
+        assert_eq!(count(&replaced, "docker rm"), 1);
+        assert_eq!(replaced.container_cache(STAX).as_deref(), Some(STAX_CACHE));
+    }
+
+    #[tokio::test]
+    async fn a_container_that_already_has_the_cache_is_left_alone() {
+        let docker = FakeDocker::new().with_container(STAX, "running");
+
+        ContainerManager::new(&docker, auto())
+            .ensure_ready(&[Device::Stax], NOW)
+            .await;
+
+        assert_eq!(mutations(&docker), 0);
     }
 }

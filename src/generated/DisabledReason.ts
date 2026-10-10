@@ -3,4 +3,4 @@
 /**
  * Why an action cannot be started now, for the UI to explain.
  */
-export type DisabledReason = "severalDevices" | "deviceActionsOff" | "noComposeFile" | "noTestSuite" | "noAiModel";
+export type DisabledReason = "severalDevices" | "deviceActionsOff" | "noComposeFile" | "noTestSuite" | "noTestSelected" | "noAiModel";

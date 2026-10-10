@@ -2,6 +2,7 @@
 
 pub mod log;
 
+mod cancel;
 mod manager;
 mod runner;
 mod runs;
@@ -10,6 +11,7 @@ mod runs;
 #[cfg(any(test, feature = "fake"))]
 pub mod fake;
 
+pub use cancel::CancelToken;
 pub use log::{Log, LogEvent, LogReceiver, LogSender, Source, Stream};
 pub use manager::{Config, ContainerManager, JobOutcome, JobResult, Outcome};
 pub use runner::{CommandRunner, Output, SystemRunner, new_run_id};

@@ -6,4 +6,9 @@ export type TestNodeView = {
 /**
  * The pytest node id.
  */
-id: string, name: string, kind: NodeKind, state: CheckState, children: Array<TestNodeView>, };
+id: string, name: string, kind: NodeKind, state: CheckState, 
+/**
+ * The ids of the devices this test failed its last run on, for a test. Empty for the
+ * rest.
+ */
+failedOn: Array<string>, children: Array<TestNodeView>, };

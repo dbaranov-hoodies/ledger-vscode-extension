@@ -23,6 +23,8 @@ pub struct DeviceSpec {
     pub name: &'static str,
     /// Name shown in the UI and stored in the existing extension settings.
     pub display_name: &'static str,
+    /// Two or three letters for tight places, such as a mark next to a test.
+    pub short_name: &'static str,
     /// Further names accepted when reading a manifest.
     pub aliases: &'static [&'static str],
     /// Directory under `build/`: the C SDK target name, also what the enforcer gets for C apps.
@@ -35,10 +37,16 @@ pub struct DeviceSpec {
 
 impl DeviceSpec {
     /// A device that every tool calls by its canonical name.
-    const fn standard(name: &'static str, display_name: &'static str, target_id: u32) -> Self {
+    const fn standard(
+        name: &'static str,
+        display_name: &'static str,
+        short_name: &'static str,
+        target_id: u32,
+    ) -> Self {
         Self {
             name,
             display_name,
+            short_name,
             aliases: &[],
             build_dir_name: name,
             cargo_ledger_name: name,
@@ -47,18 +55,18 @@ impl DeviceSpec {
     }
 }
 
-const NANO_S: DeviceSpec = DeviceSpec::standard("nanos", "Nano S", 0x3110_0004);
+const NANO_S: DeviceSpec = DeviceSpec::standard("nanos", "Nano S", "NS", 0x3110_0004);
 const NANO_S_PLUS: DeviceSpec = DeviceSpec {
     aliases: &["nanos+", "nanos2", "nanosplus"],
     build_dir_name: "nanos2",
     cargo_ledger_name: "nanosplus",
-    ..DeviceSpec::standard("nanosp", "Nano S Plus", 0x3310_0004)
+    ..DeviceSpec::standard("nanosp", "Nano S Plus", "NS+", 0x3310_0004)
 };
-const NANO_X: DeviceSpec = DeviceSpec::standard("nanox", "Nano X", 0x3300_0004);
-const STAX: DeviceSpec = DeviceSpec::standard("stax", "Stax", 0x3320_0004);
-const FLEX: DeviceSpec = DeviceSpec::standard("flex", "Flex", 0x3330_0004);
-const APEX_P: DeviceSpec = DeviceSpec::standard("apex_p", "Apex p", 0x3340_0004);
-const APEX_M: DeviceSpec = DeviceSpec::standard("apex_m", "Apex m", 0x3350_0004);
+const NANO_X: DeviceSpec = DeviceSpec::standard("nanox", "Nano X", "NX", 0x3300_0004);
+const STAX: DeviceSpec = DeviceSpec::standard("stax", "Stax", "ST", 0x3320_0004);
+const FLEX: DeviceSpec = DeviceSpec::standard("flex", "Flex", "FX", 0x3330_0004);
+const APEX_P: DeviceSpec = DeviceSpec::standard("apex_p", "Apex p", "AP", 0x3340_0004);
+const APEX_M: DeviceSpec = DeviceSpec::standard("apex_m", "Apex m", "AM", 0x3350_0004);
 
 impl Device {
     pub const ALL: [Self; 7] = [
@@ -161,6 +169,7 @@ mod tests {
     #[test]
     fn other_per_device_facts_are_unique() {
         assert!(all_distinct(specs().map(|spec| spec.display_name)));
+        assert!(all_distinct(specs().map(|spec| spec.short_name)));
         assert!(all_distinct(specs().map(|spec| spec.build_dir_name)));
         assert!(all_distinct(specs().map(|spec| spec.cargo_ledger_name)));
         assert!(all_distinct(specs().map(|spec| spec.target_id)));

@@ -6,11 +6,12 @@ use ts_rs::TS;
 
 use crate::actions::{self, GroupView};
 use crate::app::App;
-use crate::container::{ContainerState, Status};
+use crate::container::{self, ContainerState, Status};
 use crate::device::Device;
 use crate::device_ops;
 use crate::enforcer;
 use crate::environment::Environment;
+use crate::failures::Failures;
 use crate::language::Language;
 use crate::selection::AppSelection;
 use crate::test_tree::{CheckState, NodeKind, TestNode, TestSelection};
@@ -33,7 +34,7 @@ pub struct Snapshot {
 #[ts(export)]
 pub struct DockerView {
     pub running: bool,
-    /// How ready the containers of the app are.
+    /// How ready the containers of the selected devices are.
     pub status: Status,
     pub image_outdated: bool,
 }
@@ -97,6 +98,8 @@ pub struct DevicesView {
 pub struct DeviceView {
     pub id: String,
     pub name: String,
+    /// Two or three letters, for tight places.
+    pub short_name: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, TS)]
@@ -116,6 +119,8 @@ pub struct ContainerView {
 pub struct TestsView {
     pub suites: Vec<String>,
     pub suite: Option<String>,
+    /// Where the selected suite is, relative to the app folder.
+    pub directory: Option<String>,
     /// Empty until the tests were collected.
     pub tree: Vec<TestNodeView>,
     pub collecting: bool,
@@ -131,6 +136,9 @@ pub struct TestNodeView {
     pub name: String,
     pub kind: NodeKind,
     pub state: CheckState,
+    /// The ids of the devices this test failed its last run on, for a test. Empty for the
+    /// rest.
+    pub failed_on: Vec<String>,
     pub children: Vec<TestNodeView>,
 }
 
@@ -146,10 +154,21 @@ pub enum Notice {
 }
 
 pub fn build(workspace: &Workspace, env: &Environment) -> Snapshot {
+    // How ready the containers are is about those of the selected devices, which are the ones used.
+    let status = match workspace.current() {
+        Some((_, selection)) => container::aggregate(
+            selection
+                .target()
+                .devices()
+                .iter()
+                .map(|&device| env.containers.state_of(device)),
+        ),
+        None => env.containers.status(),
+    };
     Snapshot {
         docker: DockerView {
             running: env.containers.docker_available,
-            status: env.containers.status(),
+            status,
             image_outdated: env.containers.freshness == Freshness::Outdated,
         },
         apps: workspace
@@ -220,6 +239,7 @@ fn device_view(device: Device) -> DeviceView {
     DeviceView {
         id: spec.name.to_owned(),
         name: spec.display_name.to_owned(),
+        short_name: spec.short_name.to_owned(),
     }
 }
 
@@ -262,7 +282,7 @@ fn tests_view(app: &App, selection: &AppSelection, env: &Environment) -> TestsVi
             .unwrap_or_else(|| TestSelection::all(tree));
         tree.roots()
             .iter()
-            .map(|node| node_view(node, &chosen))
+            .map(|node| node_view(node, &chosen, &env.failures))
             .collect()
     });
     TestsView {
@@ -272,22 +292,32 @@ fn tests_view(app: &App, selection: &AppSelection, env: &Environment) -> TestsVi
             .map(|suite| suite.name.clone())
             .collect(),
         suite: selection.test_suite().map(str::to_owned),
+        directory: actions::suite_directory(app, selection).map(str::to_owned),
         tree: tree.unwrap_or_default(),
         collecting: env.collecting_tests,
         verbose: env.settings.verbose_tests,
     }
 }
 
-fn node_view(node: &TestNode, chosen: &TestSelection) -> TestNodeView {
+fn node_view(node: &TestNode, chosen: &TestSelection, failures: &Failures) -> TestNodeView {
+    let failed_on = match node.kind {
+        NodeKind::Test => failures
+            .devices_of(&node.id)
+            .into_iter()
+            .map(|device| device.spec().name.to_owned())
+            .collect(),
+        _ => Vec::new(),
+    };
     TestNodeView {
         id: node.id.clone(),
         name: node.name.clone(),
         kind: node.kind,
         state: chosen.state(node),
+        failed_on,
         children: node
             .children
             .iter()
-            .map(|child| node_view(child, chosen))
+            .map(|child| node_view(child, chosen, failures))
             .collect(),
     }
 }
@@ -401,12 +431,14 @@ mod tests {
                 device: Device::Stax,
                 state: ContainerState::Running,
                 image_id: None,
+                pip_cache_ready: true,
                 busy: true,
             },
             ObservedContainer {
                 device: Device::Flex,
                 state: ContainerState::Stopped,
                 image_id: None,
+                pip_cache_ready: true,
                 busy: false,
             },
         ];
@@ -414,7 +446,7 @@ mod tests {
         let snapshot = build(&workspace(vec![app]), &env);
 
         assert!(snapshot.docker.running);
-        assert_eq!(snapshot.docker.status, Status::Stopped);
+        assert_eq!(snapshot.docker.status, Status::Running, "Stax is selected");
         assert!(snapshot.docker.image_outdated);
         let containers = &current(&snapshot).containers;
         assert_eq!(containers.len(), 5, "one per device of the app");
@@ -426,6 +458,28 @@ mod tests {
         assert_eq!(flex.state, ContainerState::Stopped);
         let nano = containers.iter().find(|c| c.device.id == "nanox").unwrap();
         assert_eq!(nano.state, ContainerState::Missing);
+    }
+
+    #[test]
+    fn the_status_is_about_the_containers_of_the_selected_devices_only() {
+        let app = c_app();
+        let mut env = environment(&app);
+        // Only the Stax container exists, and Stax is the selected device.
+        env.containers
+            .containers
+            .retain(|container| container.device == Device::Stax);
+        let mut workspace = workspace(vec![app]);
+        let one = build(&workspace, &env);
+        let (app, selection) = workspace.current_mut().unwrap();
+        selection.set_target(&Target::new([Device::Stax, Device::Flex]).unwrap(), app);
+        let two = build(&workspace, &env);
+
+        assert_eq!(one.docker.status, Status::Running);
+        assert_eq!(
+            two.docker.status,
+            Status::Stopped,
+            "the Flex container is missing"
+        );
     }
 
     #[test]

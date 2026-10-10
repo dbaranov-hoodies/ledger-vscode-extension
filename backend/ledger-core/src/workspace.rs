@@ -95,6 +95,15 @@ impl Workspace {
         Some((&entry.app, &mut entry.selection))
     }
 
+    /// An app of the workspace, with its choices to change.
+    pub fn app_mut(&mut self, folder: &Path) -> Option<(&App, &mut AppSelection)> {
+        let entry = self
+            .entries
+            .iter_mut()
+            .find(|entry| entry.app.folder == folder)?;
+        Some((&entry.app, &mut entry.selection))
+    }
+
     fn current_index(&self) -> Option<usize> {
         let current = self.current.as_ref()?;
         self.entries

@@ -2,6 +2,7 @@
 //! user starts; the extension only talks to VS Code and to the user.
 
 pub mod protocol;
+mod pytest_cache;
 pub mod server;
 pub mod wire;
 

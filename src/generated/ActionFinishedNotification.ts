@@ -3,6 +3,10 @@ import type { ActionId } from "./ActionId";
 
 export type ActionFinishedNotification = { id: ActionId, success: boolean, 
 /**
+ * The user stopped it, which is not a failure to report.
+ */
+cancelled: boolean, 
+/**
  * Why it failed.
  */
 message: string | null, };

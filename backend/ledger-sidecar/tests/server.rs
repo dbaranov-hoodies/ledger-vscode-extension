@@ -2,6 +2,7 @@
 //! on its own.
 
 use std::collections::VecDeque;
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -515,4 +516,623 @@ async fn what_was_saved_is_given_back_at_initialize() {
     let snapshot = second.ok("initialize", params).await;
 
     assert_eq!(snapshot["app"]["devices"]["selected"], json!(["flex"]));
+}
+
+#[tokio::test]
+async fn the_ai_models_of_the_extension_enable_the_ai_review_and_a_choice_is_kept() {
+    let (mut harness, first) = Harness::initialized(docker()).await;
+    assert_eq!(action(&first, "AI Review")["disabledReason"], "noAiModel");
+
+    let snapshot = harness
+        .ok(
+            "setAi",
+            json!({ "models": ["gpt-a", "gpt-b"], "selected": "gpt-b" }),
+        )
+        .await;
+
+    assert_eq!(
+        snapshot["app"]["aiModels"]["items"],
+        json!(["gpt-a", "gpt-b"])
+    );
+    assert_eq!(snapshot["app"]["aiModels"]["selected"], "gpt-b");
+    assert_eq!(action(&snapshot, "AI Review")["enabled"], true);
+    let unknown = harness
+        .ok("setAi", json!({ "models": ["gpt-a"], "selected": "gone" }))
+        .await;
+    assert_eq!(unknown["app"]["aiModels"]["selected"], "gpt-a");
+    let none = harness
+        .ok("setAi", json!({ "models": [], "selected": null }))
+        .await;
+    assert_eq!(action(&none, "AI Review")["enabled"], false);
+}
+
+const STAX_CONTAINER: &str = "app-boilerplate-container-stax";
+const TESTS_OUTPUT: &str = "tests/standalone/test_a.py::test_x[stax]\n\
+    tests/standalone/test_a.py::test_y[stax]\n\
+    tests/standalone/sub/test_b.py::test_z[stax]\n\n3 tests collected in 0.02s\n";
+
+/// A running container for the selected device, and a pytest that finds three tests.
+fn docker_with_tests() -> FakeDocker {
+    docker()
+        .with_container(STAX_CONTAINER, "running")
+        .with_exec_output("--collect-only", TESTS_OUTPUT)
+}
+
+fn has_tests(snapshot: &Value) -> bool {
+    !snapshot["app"]["tests"]["tree"]
+        .as_array()
+        .unwrap()
+        .is_empty()
+}
+
+/// The state of the node with this id, looking through the whole tree.
+fn test_state(tree: &Value, id: &str) -> Option<String> {
+    tree.as_array()?.iter().find_map(|node| {
+        if node["id"] == id {
+            node["state"].as_str().map(str::to_owned)
+        } else {
+            test_state(&node["children"], id)
+        }
+    })
+}
+
+#[tokio::test]
+async fn the_tests_are_listed_when_the_container_of_the_device_is_running() {
+    let (mut harness, first) = Harness::initialized(docker_with_tests()).await;
+    assert_eq!(first["app"]["tests"]["collecting"], true, "told at once");
+
+    let listed = harness.wait_for("snapshot", has_tests).await;
+
+    let tests = &listed["app"]["tests"];
+    assert_eq!(tests["collecting"], false);
+    assert_eq!(tests["suites"], json!(["standalone", "swap"]));
+    assert_eq!(tests["suite"], "standalone");
+    assert_eq!(tests["directory"], "./tests/standalone/");
+    assert_eq!(tests["tree"][0]["id"], "tests");
+    assert_eq!(tests["tree"][0]["kind"], "directory");
+    for id in [
+        "tests",
+        "tests/standalone/test_a.py::test_x",
+        "tests/standalone/sub",
+    ] {
+        assert_eq!(
+            test_state(&tests["tree"], id).as_deref(),
+            Some("checked"),
+            "{id}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn without_a_running_container_the_tests_wait_until_they_are_asked_for() {
+    let (mut harness, first) =
+        Harness::initialized(docker().with_exec_output("--collect-only", TESTS_OUTPUT)).await;
+    assert_eq!(first["app"]["tests"]["collecting"], false);
+    assert!(!has_tests(&first));
+
+    let asked = harness.ok("collectTests", json!({})).await;
+    assert_eq!(asked["app"]["tests"]["collecting"], true);
+    let listed = harness.wait_for("snapshot", has_tests).await;
+
+    assert!(has_tests(&listed));
+    let stax = listed["app"]["containers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|container| container["device"]["id"] == "stax")
+        .unwrap()
+        .clone();
+    assert_eq!(
+        stax["state"], "running",
+        "the container was made ready for it"
+    );
+}
+
+#[tokio::test]
+async fn toggling_a_node_changes_the_tests_below_it_and_is_saved() {
+    let (mut harness, _) = Harness::initialized(docker_with_tests()).await;
+    harness.wait_for("snapshot", has_tests).await;
+
+    let snapshot = harness
+        .ok("toggleTest", json!({ "id": "tests/standalone/test_a.py" }))
+        .await;
+
+    let tree = &snapshot["app"]["tests"]["tree"];
+    assert_eq!(
+        test_state(tree, "tests/standalone/test_a.py").as_deref(),
+        Some("unchecked")
+    );
+    assert_eq!(
+        test_state(tree, "tests/standalone/test_a.py::test_x").as_deref(),
+        Some("unchecked")
+    );
+    assert_eq!(
+        test_state(tree, "tests/standalone").as_deref(),
+        Some("partial")
+    );
+    assert_eq!(
+        test_state(tree, "tests/standalone/sub").as_deref(),
+        Some("checked")
+    );
+    let saved = harness.notifications("saved").pop().unwrap();
+    assert_eq!(
+        saved["saved"]["apps"][APP]["tests"],
+        json!(["tests/standalone/sub/test_b.py::test_z"])
+    );
+
+    harness
+        .ok("toggleTest", json!({ "id": "tests/standalone/test_a.py" }))
+        .await;
+    let saved = harness.notifications("saved").pop().unwrap();
+    assert!(
+        saved["saved"]["apps"][APP].get("tests").is_none(),
+        "all are chosen again"
+    );
+}
+
+#[tokio::test]
+async fn only_the_chosen_tests_run_and_none_chosen_turns_the_actions_off() {
+    let (mut harness, _) = Harness::initialized(docker_with_tests()).await;
+    harness.wait_for("snapshot", has_tests).await;
+
+    let none = harness.ok("setTests", json!({ "ids": [] })).await;
+    assert_eq!(
+        action(&none, "Run Tests")["disabledReason"],
+        "noTestSelected"
+    );
+    let refused = harness
+        .call("runAction", json!({ "id": "Run Tests" }))
+        .await
+        .unwrap_err();
+    assert!(refused.1.contains("no test is selected"), "{refused:?}");
+
+    harness
+        .ok(
+            "setTests",
+            json!({ "ids": ["tests/standalone/sub/test_b.py::test_z", "gone.py::x"] }),
+        )
+        .await;
+    harness.ok("runAction", json!({ "id": "Run Tests" })).await;
+    let finished = harness.wait_for("actionFinished", |_| true).await;
+
+    assert_eq!(finished["success"], true, "{finished}");
+    let commands: Vec<String> = harness
+        .notifications("log")
+        .iter()
+        .filter(|log| log["kind"] == "started")
+        .map(|log| log["command"].as_str().unwrap().to_owned())
+        .collect();
+    assert!(
+        commands
+            .iter()
+            .any(|command| command.starts_with("pytest tests/standalone/sub ")),
+        "{commands:?}"
+    );
+}
+
+#[tokio::test]
+async fn the_tests_cannot_be_chosen_before_they_are_listed() {
+    let (mut harness, _) = Harness::initialized(docker()).await;
+
+    let failure = harness
+        .call("toggleTest", json!({ "id": "tests" }))
+        .await
+        .unwrap_err();
+
+    assert!(failure.1.contains("not listed"), "{failure:?}");
+}
+
+#[tokio::test]
+async fn changing_the_suite_lists_the_tests_again_and_forgets_the_choice() {
+    let (mut harness, _) = Harness::initialized(docker_with_tests()).await;
+    harness.wait_for("snapshot", has_tests).await;
+    harness
+        .ok("toggleTest", json!({ "id": "tests/standalone/test_a.py" }))
+        .await;
+
+    let changed = harness.ok("setTestSuite", json!({ "name": "swap" })).await;
+    assert_eq!(changed["app"]["tests"]["suite"], "swap");
+    assert_eq!(changed["app"]["tests"]["directory"], "./tests/swap/");
+    assert_eq!(changed["app"]["tests"]["collecting"], true);
+    let listed = harness.wait_for("snapshot", has_tests).await;
+
+    assert_eq!(
+        test_state(&listed["app"]["tests"]["tree"], "tests").as_deref(),
+        Some("checked")
+    );
+    let failure = harness
+        .call("setTestSuite", json!({ "name": "nope" }))
+        .await
+        .unwrap_err();
+    assert_eq!(failure.0, -32602);
+}
+
+#[tokio::test]
+async fn a_failing_listing_is_reported_and_ends() {
+    let (mut harness, _) =
+        Harness::initialized(docker_with_tests().fail("--collect-only", 1)).await;
+
+    let message = harness
+        .wait_for("message", |message| message["level"] == "error")
+        .await;
+    let later = harness
+        .wait_for("snapshot", |snapshot| {
+            snapshot["app"]["tests"]["collecting"] == false
+        })
+        .await;
+
+    assert!(
+        message["text"]
+            .as_str()
+            .unwrap()
+            .contains("could not be listed")
+    );
+    assert!(!has_tests(&later));
+}
+
+#[tokio::test]
+async fn the_chosen_tests_come_back_with_the_saved_state() {
+    let (mut first, _) = Harness::initialized(docker_with_tests()).await;
+    first.wait_for("snapshot", has_tests).await;
+    first
+        .ok(
+            "toggleTest",
+            json!({ "id": "tests/standalone/test_a.py::test_x" }),
+        )
+        .await;
+    let saved = first.notifications("saved").pop().unwrap()["saved"].clone();
+
+    let mut second = Harness::new(docker_with_tests());
+    let mut params = initialize_params(vec![folder(APP, BOILERPLATE)]);
+    params["saved"] = saved;
+    second.ok("initialize", params).await;
+    let listed = second.wait_for("snapshot", has_tests).await;
+
+    let tree = &listed["app"]["tests"]["tree"];
+    assert_eq!(
+        test_state(tree, "tests/standalone/test_a.py::test_x").as_deref(),
+        Some("unchecked")
+    );
+    assert_eq!(
+        test_state(tree, "tests/standalone/test_a.py::test_y").as_deref(),
+        Some("checked")
+    );
+}
+
+/// The log notification for a command that started in a container, once it did.
+async fn wait_for_command(harness: &mut Harness, text: &'static str) {
+    harness
+        .wait_for("log", move |log| {
+            log["kind"] == "started" && log["command"].as_str().unwrap().contains(text)
+        })
+        .await;
+}
+
+#[tokio::test]
+async fn a_running_action_is_stopped_on_request_and_says_it_was_cancelled() {
+    let docker = docker_with_tests().blocking("make -C");
+    let (mut harness, _) = Harness::initialized(docker).await;
+    harness.ok("runAction", json!({ "id": "Build App" })).await;
+    wait_for_command(&mut harness, "make -C").await;
+
+    let answer = harness
+        .ok("cancelAction", json!({ "id": "Build App" }))
+        .await;
+    let finished = harness.wait_for("actionFinished", |_| true).await;
+
+    assert_eq!(answer, Value::Null);
+    assert_eq!(finished["id"], "Build App");
+    assert_eq!(finished["success"], false);
+    assert_eq!(finished["cancelled"], true);
+    assert_eq!(finished["message"], Value::Null, "not a failure to report");
+    let later = harness
+        .wait_for("snapshot", |snapshot| {
+            action(snapshot, "Build App")["running"] == false
+        })
+        .await;
+    assert_eq!(action(&later, "Build App")["running"], false);
+}
+
+#[tokio::test]
+async fn stopping_a_pull_does_not_go_on_to_create_the_containers() {
+    let docker = docker().blocking("docker pull");
+    let (mut harness, _) = Harness::initialized(docker).await;
+    harness
+        .ok("runAction", json!({ "id": "Update Container" }))
+        .await;
+    wait_for_command(&mut harness, "docker pull").await;
+
+    harness
+        .ok("cancelAction", json!({ "id": "Update Container" }))
+        .await;
+    let finished = harness.wait_for("actionFinished", |_| true).await;
+
+    assert_eq!(finished["cancelled"], true);
+    let commands: Vec<String> = harness
+        .notifications("log")
+        .iter()
+        .filter(|log| log["kind"] == "started")
+        .map(|log| log["command"].as_str().unwrap().to_owned())
+        .collect();
+    assert!(
+        !commands
+            .iter()
+            .any(|command| command.starts_with("docker run")),
+        "{commands:?}"
+    );
+}
+
+#[tokio::test]
+async fn an_action_that_is_not_running_cannot_be_stopped() {
+    let (mut harness, _) = Harness::initialized(docker()).await;
+
+    let failure = harness
+        .call("cancelAction", json!({ "id": "Build App" }))
+        .await
+        .unwrap_err();
+
+    assert!(failure.1.contains("not running"), "{failure:?}");
+}
+
+#[tokio::test]
+async fn an_action_finished_normally_is_not_reported_as_cancelled() {
+    let (mut harness, _) = Harness::initialized(docker()).await;
+    harness.ok("runAction", json!({ "id": "Build App" })).await;
+
+    let finished = harness.wait_for("actionFinished", |_| true).await;
+
+    assert_eq!(finished["success"], true);
+    assert_eq!(finished["cancelled"], false);
+}
+
+/// An app folder on disk, named like the app of the other tests, where pytest left these ids as
+/// the tests that failed their last run on each device.
+fn app_with_failures(name: &str, failed: &[(&str, &[&str])]) -> String {
+    let folder = Path::new(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("{name}-{}", std::process::id()))
+        .join("app-boilerplate");
+    std::fs::create_dir_all(&folder).unwrap();
+    for (device, ids) in failed {
+        write_failures(&folder, device, ids);
+    }
+    folder.to_string_lossy().into_owned()
+}
+
+fn write_failures(folder: &Path, device: &str, ids: &[&str]) {
+    let file = folder.join(format!(".pytest_cache/{device}/v/cache/lastfailed"));
+    std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+    let failed: serde_json::Map<String, Value> = ids
+        .iter()
+        .map(|id| ((*id).to_owned(), json!(true)))
+        .collect();
+    std::fs::write(file, Value::Object(failed).to_string()).unwrap();
+}
+
+/// The server with the three tests listed, for the app in this folder.
+async fn listed_in(folder: &str) -> (Harness, Value) {
+    let mut harness = Harness::new(docker_with_tests());
+    harness
+        .ok(
+            "initialize",
+            initialize_params(vec![self::folder(folder, BOILERPLATE)]),
+        )
+        .await;
+    let listed = harness.wait_for("snapshot", has_tests).await;
+    (harness, listed)
+}
+
+/// The devices the test with this id failed on, looking through the whole tree.
+fn failed_on(tree: &Value, id: &str) -> Option<Value> {
+    tree.as_array()?.iter().find_map(|node| {
+        if node["id"] == id {
+            Some(node["failedOn"].clone())
+        } else {
+            failed_on(&node["children"], id)
+        }
+    })
+}
+
+const TEST_X: &str = "tests/standalone/test_a.py::test_x";
+const TEST_Y: &str = "tests/standalone/test_a.py::test_y";
+const TEST_Z: &str = "tests/standalone/sub/test_b.py::test_z";
+
+fn failures_of_two_devices(name: &str) -> String {
+    app_with_failures(
+        name,
+        &[
+            (
+                "stax",
+                &[TEST_X, "tests/standalone/test_a.py::test_y[stax]"],
+            ),
+            ("flex", &[TEST_Y, TEST_Z]),
+        ],
+    )
+}
+
+#[tokio::test]
+async fn the_devices_a_test_failed_on_are_known_when_the_tests_are_listed() {
+    let (_harness, listed) = listed_in(&failures_of_two_devices("failures-listed")).await;
+
+    let tree = &listed["app"]["tests"]["tree"];
+    assert_eq!(failed_on(tree, TEST_X), Some(json!(["stax"])));
+    assert_eq!(failed_on(tree, TEST_Y), Some(json!(["stax", "flex"])));
+    assert_eq!(failed_on(tree, TEST_Z), Some(json!(["flex"])));
+    assert_eq!(failed_on(tree, "tests"), Some(json!([])), "only tests fail");
+}
+
+#[tokio::test]
+async fn the_failures_of_a_device_stay_when_another_device_is_selected() {
+    let (mut harness, _) = listed_in(&failures_of_two_devices("failures-stay")).await;
+
+    let other = harness
+        .ok("setDevices", json!({ "devices": ["nanox"] }))
+        .await;
+
+    let tree = &other["app"]["tests"]["tree"];
+    assert_eq!(failed_on(tree, TEST_Y), Some(json!(["stax", "flex"])));
+}
+
+#[tokio::test]
+async fn the_failed_tests_chosen_are_those_of_the_selected_devices() {
+    let path = failures_of_two_devices("failures-select");
+    let (mut harness, _) = listed_in(&path).await;
+    let state = |snapshot: &Value, id: &str| test_state(&snapshot["app"]["tests"]["tree"], id);
+
+    let stax = harness.ok("selectFailedTests", json!({})).await;
+    assert_eq!(state(&stax, TEST_X).as_deref(), Some("checked"));
+    assert_eq!(state(&stax, TEST_Y).as_deref(), Some("checked"));
+    assert_eq!(state(&stax, TEST_Z).as_deref(), Some("unchecked"));
+    let saved = harness.notifications("saved").pop().unwrap();
+    assert_eq!(
+        saved["saved"]["apps"][&path]["tests"],
+        json!([TEST_X, TEST_Y])
+    );
+
+    harness
+        .ok("setDevices", json!({ "devices": ["flex"] }))
+        .await;
+    let flex = harness.ok("selectFailedTests", json!({})).await;
+    assert_eq!(state(&flex, TEST_X).as_deref(), Some("unchecked"));
+    assert_eq!(state(&flex, TEST_Z).as_deref(), Some("checked"));
+
+    harness
+        .ok("setDevices", json!({ "devices": ["stax", "flex"] }))
+        .await;
+    let both = harness.ok("selectFailedTests", json!({})).await;
+    for id in [TEST_X, TEST_Y, TEST_Z] {
+        assert_eq!(state(&both, id).as_deref(), Some("checked"), "{id}");
+    }
+}
+
+#[tokio::test]
+async fn without_failures_on_the_selected_devices_the_choice_stays_and_the_user_is_told() {
+    let (mut harness, _) = listed_in(&failures_of_two_devices("failures-none")).await;
+    harness
+        .ok("setDevices", json!({ "devices": ["nanox"] }))
+        .await;
+    harness.ok("setTests", json!({ "ids": [TEST_X] })).await;
+
+    let answer = harness.ok("selectFailedTests", json!({})).await;
+
+    let tree = &answer["app"]["tests"]["tree"];
+    assert_eq!(test_state(tree, TEST_X).as_deref(), Some("checked"));
+    assert_eq!(test_state(tree, TEST_Y).as_deref(), Some("unchecked"));
+    let messages = harness.notifications("message");
+    assert_eq!(
+        messages.last().unwrap(),
+        &json!({ "level": "info", "text": "No failed tests on Nano X." })
+    );
+}
+
+#[tokio::test]
+async fn failed_tests_cannot_be_chosen_before_the_tests_are_listed() {
+    let (mut harness, _) = Harness::initialized(docker()).await;
+
+    let failure = harness
+        .call("selectFailedTests", json!({}))
+        .await
+        .unwrap_err();
+
+    assert!(failure.1.contains("not listed"), "{failure:?}");
+}
+
+#[tokio::test]
+async fn the_failures_are_read_again_when_tests_have_run() {
+    let path = app_with_failures("failures-run", &[]);
+    let (mut harness, listed) = listed_in(&path).await;
+    assert_eq!(
+        failed_on(&listed["app"]["tests"]["tree"], TEST_X),
+        Some(json!([]))
+    );
+
+    // What pytest writes while the tests run in the container.
+    write_failures(Path::new(&path), "stax", &[TEST_X]);
+    harness.ok("runAction", json!({ "id": "Run Tests" })).await;
+    harness.wait_for("actionFinished", |_| true).await;
+
+    let after = harness
+        .wait_for("snapshot", |snapshot| {
+            failed_on(&snapshot["app"]["tests"]["tree"], TEST_X) == Some(json!(["stax"]))
+        })
+        .await;
+    assert_eq!(
+        failed_on(&after["app"]["tests"]["tree"], TEST_Y),
+        Some(json!([]))
+    );
+}
+
+fn write_file(folder: &str, relative: &str, text: &str) {
+    let file = Path::new(folder).join(relative);
+    std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+    std::fs::write(file, text).unwrap();
+}
+
+#[tokio::test]
+async fn a_file_a_class_or_a_test_is_located_by_its_path_and_line() {
+    let folder = app_with_failures("locate", &[]);
+    write_file(
+        &folder,
+        "tests/standalone/test_a.py",
+        "import pytest\n\n\ndef test_x():\n    pass\n\n\ndef test_y():\n    pass\n",
+    );
+    write_file(
+        &folder,
+        "tests/standalone/sub/test_b.py",
+        "\n\ndef test_z():\n    pass\n",
+    );
+    let (mut harness, _) = listed_in(&folder).await;
+
+    let located = |answer: &Value| {
+        (
+            std::path::PathBuf::from(answer["path"].as_str().unwrap()),
+            answer["line"].as_u64().unwrap(),
+        )
+    };
+    let in_app = |relative: &str| Path::new(&folder).join(relative);
+
+    let test = harness.ok("locateTest", json!({ "id": TEST_Y })).await;
+    assert_eq!(located(&test), (in_app("tests/standalone/test_a.py"), 8));
+    let file = harness
+        .ok("locateTest", json!({ "id": "tests/standalone/test_a.py" }))
+        .await;
+    assert_eq!(located(&file), (in_app("tests/standalone/test_a.py"), 1));
+    let deeper = harness.ok("locateTest", json!({ "id": TEST_Z })).await;
+    assert_eq!(
+        located(&deeper),
+        (in_app("tests/standalone/sub/test_b.py"), 3)
+    );
+}
+
+#[tokio::test]
+async fn what_cannot_be_opened_says_why() {
+    let folder = app_with_failures("locate-refused", &[]);
+    let (mut harness, _) = listed_in(&folder).await;
+
+    let directory = harness
+        .call("locateTest", json!({ "id": "tests" }))
+        .await
+        .unwrap_err();
+    assert!(directory.1.contains("directory"), "{directory:?}");
+    let unknown = harness
+        .call("locateTest", json!({ "id": "gone.py::test" }))
+        .await
+        .unwrap_err();
+    assert!(unknown.1.contains("no such node"), "{unknown:?}");
+    let missing_file = harness
+        .call("locateTest", json!({ "id": TEST_X }))
+        .await
+        .unwrap_err();
+    assert!(missing_file.1.contains("not in"), "{missing_file:?}");
+}
+
+#[tokio::test]
+async fn a_test_cannot_be_located_before_the_tests_are_listed() {
+    let (mut harness, _) = Harness::initialized(docker()).await;
+
+    let failure = harness
+        .call("locateTest", json!({ "id": TEST_X }))
+        .await
+        .unwrap_err();
+
+    assert!(failure.1.contains("not listed"), "{failure:?}");
 }

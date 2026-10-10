@@ -9,6 +9,7 @@ use crate::device::Device;
 use crate::device_ops::{DeviceSettings, Onboarding};
 use crate::docker::ContainerUser;
 use crate::environment::{Environment, Settings};
+use crate::failures::Failures;
 use crate::host_python::HostPython;
 use crate::manifest::{self, ParsedManifest};
 use crate::platform::Platform;
@@ -65,6 +66,7 @@ pub fn environment(app: &App) -> Environment {
             device,
             state: ContainerState::Running,
             image_id: Some("sha256:a".to_owned()),
+            pip_cache_ready: true,
             busy: false,
         })
         .collect();
@@ -100,6 +102,7 @@ pub fn environment(app: &App) -> Environment {
             "test_a.py::test_x\ntest_a.py::test_y\nsub/test_b.py::test_z\n",
         )),
         collecting_tests: false,
+        failures: Failures::default(),
         test_helpers: true,
         running: BTreeSet::new(),
         ai_models: vec!["gpt".to_owned()],

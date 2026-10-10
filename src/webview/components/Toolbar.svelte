@@ -90,7 +90,7 @@
         {#each group.actions as action}
           <Toolbar.Button
             class="toolbar-button {getStatusClass(action.status)}"
-            disabled={action.disabled || action.status === "running"}
+            disabled={action.disabled && action.status !== "running"}
             title={action.tooltip ?? action.label}
             onclick={() => onExecute(action.group, action.id)}
           >

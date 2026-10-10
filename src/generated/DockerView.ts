@@ -3,6 +3,6 @@ import type { Status } from "./Status";
 
 export type DockerView = { running: boolean, 
 /**
- * How ready the containers of the app are.
+ * How ready the containers of the selected devices are.
  */
 status: Status, imageOutdated: boolean, };

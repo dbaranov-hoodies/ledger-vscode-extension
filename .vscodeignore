@@ -4,6 +4,7 @@ out/**
 node_modules/**
 src/**
 backend/**
+scripts/**
 tmp/**
 .gitignore
 .yarnrc

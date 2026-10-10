@@ -32,11 +32,25 @@ impl ContainerState {
     }
 }
 
-/// Reads the output of [`crate::docker::container_status`]: the state and the image id.
-pub fn parse_inspect(output: &str) -> (ContainerState, Option<String>) {
+/// What `docker inspect` says of a container.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Inspected {
+    pub state: ContainerState,
+    /// The image the container was created from.
+    pub image_id: Option<String>,
+    /// The volume mounted as its pip cache.
+    pub pip_cache: Option<String>,
+}
+
+/// Reads the output of [`crate::docker::container_status`].
+pub fn parse_inspect(output: &str) -> Inspected {
     let mut words = output.split_whitespace();
     let state = ContainerState::from_docker_status(words.next().unwrap_or(""));
-    (state, words.next().map(str::to_owned))
+    Inspected {
+        state,
+        image_id: words.next().map(str::to_owned),
+        pip_cache: words.next().map(str::to_owned),
+    }
 }
 
 /// How ready the containers of a target are.
@@ -75,6 +89,9 @@ pub struct ObservedContainer {
     pub state: ContainerState,
     /// The image the container was created from.
     pub image_id: Option<String>,
+    /// It mounts the pip cache that its user can write to. Without it, every container downloads
+    /// and builds the packages of the tests again.
+    pub pip_cache_ready: bool,
     /// A run is active in it, so it must not be replaced.
     pub busy: bool,
 }
@@ -105,13 +122,15 @@ impl Observation {
             .map_or(ContainerState::Missing, |container| container.state)
     }
 
-    /// The container was created from an older image than the local one.
+    /// The container should be created again: it comes from an older image than the local one,
+    /// or it lacks the pip cache that it needs.
     pub fn is_stale(&self, container: &ObservedContainer) -> bool {
         container.state != ContainerState::Missing
-            && matches!(
-                (&container.image_id, &self.image_id),
-                (Some(created_from), Some(local)) if created_from != local
-            )
+            && (!container.pip_cache_ready
+                || matches!(
+                    (&container.image_id, &self.image_id),
+                    (Some(created_from), Some(local)) if created_from != local
+                ))
     }
 }
 
@@ -243,6 +262,7 @@ mod tests {
             device,
             state,
             image_id: (state != Missing).then(|| image.to_owned()),
+            pip_cache_ready: true,
             busy,
         }
     }
@@ -297,13 +317,50 @@ mod tests {
     }
 
     #[test]
-    fn the_inspect_output_gives_the_state_and_the_image() {
+    fn the_inspect_output_gives_the_state_the_image_and_the_pip_cache() {
+        let inspected = |state, image: Option<&str>, cache: Option<&str>| Inspected {
+            state,
+            image_id: image.map(str::to_owned),
+            pip_cache: cache.map(str::to_owned),
+        };
+
         assert_eq!(
-            parse_inspect("running sha256:abc\n"),
-            (Running, Some("sha256:abc".to_owned()))
+            parse_inspect("running sha256:abc ledger-pip-cache-1000\n"),
+            inspected(Running, Some("sha256:abc"), Some("ledger-pip-cache-1000"))
         );
-        assert_eq!(parse_inspect("exited"), (Stopped, None));
-        assert_eq!(parse_inspect(""), (Stopped, None));
+        assert_eq!(
+            parse_inspect("running sha256:abc \n"),
+            inspected(Running, Some("sha256:abc"), None),
+            "a container made before the cache had a volume of its own"
+        );
+        assert_eq!(parse_inspect("exited"), inspected(Stopped, None, None));
+        assert_eq!(parse_inspect(""), inspected(Stopped, None, None));
+    }
+
+    #[test]
+    fn a_container_without_the_pip_cache_is_replaced_like_one_on_an_old_image() {
+        let mut without_cache = container(Device::Stax, Running, LOCAL, false);
+        without_cache.pip_cache_ready = false;
+        let observed = observe(true, UNKNOWN, vec![without_cache.clone()]);
+
+        assert_eq!(
+            plan(&observed, &AUTO),
+            steps(vec![Operation::Create(Device::Stax)])
+        );
+        assert_eq!(
+            plan(&observed, &MANUAL),
+            Plan::Nothing,
+            "never without auto update"
+        );
+        without_cache.busy = true;
+        assert_eq!(
+            plan(&observe(true, UNKNOWN, vec![without_cache]), &AUTO),
+            Plan::Steps {
+                operations: vec![],
+                deferred: vec![Device::Stax]
+            },
+            "a run in it is not interrupted"
+        );
     }
 
     #[test]

@@ -10,7 +10,7 @@ use crate::enforcer;
 use crate::language::Language;
 use crate::manifest::AppManifest;
 use crate::target::{Resolution, Target};
-use crate::test_tree::TestSelection;
+use crate::test_tree::{TestSelection, TestTree};
 
 /// The choices for one app. Each one is always something the app offers: the fields are private
 /// and every change is checked against the [`App`].
@@ -72,6 +72,38 @@ impl AppSelection {
 
     pub fn enforcer_check(&self) -> Option<&str> {
         self.enforcer_check.as_deref()
+    }
+
+    /// Checks or unchecks a node of the tests, and everything below it. Returns whether the tree
+    /// has this node.
+    pub fn toggle_test(&mut self, tree: &TestTree, id: &str) -> bool {
+        let Some(node) = tree.find(id) else {
+            return false;
+        };
+        let mut chosen = self
+            .tests
+            .take()
+            .unwrap_or_else(|| TestSelection::all(tree));
+        chosen.toggle(node);
+        self.tests = Some(chosen).filter(|chosen| *chosen != TestSelection::all(tree));
+        true
+    }
+
+    /// Chooses these tests, or all of them when `None`. Ids the tree does not have are ignored.
+    pub fn set_tests(&mut self, tree: &TestTree, ids: Option<Vec<String>>) {
+        self.tests = ids.map(TestSelection::from_ids);
+        self.retain_tests(tree);
+    }
+
+    /// Forgets the chosen tests that a new collection no longer has. Choosing every test is the
+    /// same as choosing none, so it is not kept as a choice.
+    pub fn retain_tests(&mut self, tree: &TestTree) {
+        if let Some(chosen) = &mut self.tests {
+            chosen.retain_existing(tree);
+        }
+        if self.tests.as_ref() == Some(&TestSelection::all(tree)) {
+            self.tests = None;
+        }
     }
 
     /// `All` or the name of a check. Returns whether the enforcer has this check.
@@ -502,6 +534,68 @@ directory = \"./tests/standalone/\"
 
         assert!(selection.set_enforcer_check("All"));
         assert_eq!(selection.enforcer_check(), None);
+    }
+
+    fn tree() -> TestTree {
+        TestTree::from_collect_output("a.py::test_1\na.py::test_2\nb.py::test_3\n")
+    }
+
+    #[test]
+    fn toggling_a_node_starts_from_every_test_and_back_to_none_chosen_when_all_are() {
+        let app = app("\"stax\"");
+        let tree = tree();
+        let mut selection = selection(&app);
+
+        assert!(selection.toggle_test(&tree, "a.py"));
+        let chosen = selection.tests.clone().unwrap();
+        assert_eq!(chosen.ids().collect::<Vec<_>>(), ["b.py::test_3"]);
+
+        assert!(selection.toggle_test(&tree, "a.py::test_1"));
+        assert_eq!(selection.tests.as_ref().unwrap().ids().count(), 2);
+
+        assert!(selection.toggle_test(&tree, "a.py"));
+        assert_eq!(selection.tests, None, "every test is chosen again");
+        assert!(!selection.toggle_test(&tree, "nope.py"));
+    }
+
+    #[test]
+    fn tests_are_chosen_by_id_and_unknown_ids_are_ignored() {
+        let app = app("\"stax\"");
+        let tree = tree();
+        let mut selection = selection(&app);
+
+        selection.set_tests(
+            &tree,
+            Some(vec!["b.py::test_3".into(), "gone.py::x".into()]),
+        );
+        assert_eq!(
+            selection.tests.as_ref().unwrap().ids().collect::<Vec<_>>(),
+            ["b.py::test_3"]
+        );
+
+        selection.set_tests(&tree, Some(Vec::new()));
+        assert!(selection.tests.as_ref().unwrap().is_empty(), "none chosen");
+
+        selection.set_tests(&tree, None);
+        assert_eq!(selection.tests, None);
+    }
+
+    #[test]
+    fn a_new_collection_drops_the_chosen_tests_that_are_gone() {
+        let app = app("\"stax\"");
+        let mut selection = selection(&app);
+        selection.set_tests(
+            &tree(),
+            Some(vec!["a.py::test_1".into(), "b.py::test_3".into()]),
+        );
+
+        let after = TestTree::from_collect_output("a.py::test_1\na.py::test_2\n");
+        selection.retain_tests(&after);
+
+        assert_eq!(
+            selection.tests.as_ref().unwrap().ids().collect::<Vec<_>>(),
+            ["a.py::test_1"]
+        );
     }
 
     #[test]
