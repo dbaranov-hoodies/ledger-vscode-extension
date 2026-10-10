@@ -1,5 +1,8 @@
 //! The development containers of an app, one per device, and what to do to make them ready.
 
+use serde::Serialize;
+use ts_rs::TS;
+
 use crate::device::Device;
 use crate::update::Freshness;
 
@@ -8,7 +11,9 @@ pub fn container_name(app_folder: &str, device: Device) -> String {
     format!("{app_folder}-container-{}", device.spec().name)
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, TS)]
+#[serde(rename_all = "lowercase")]
+#[ts(export)]
 pub enum ContainerState {
     Missing,
     Stopped,
@@ -35,7 +40,9 @@ pub fn parse_inspect(output: &str) -> (ContainerState, Option<String>) {
 }
 
 /// How ready the containers of a target are.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, TS)]
+#[serde(rename_all = "lowercase")]
+#[ts(export)]
 pub enum Status {
     Running,
     /// No container is down, but some is still starting.

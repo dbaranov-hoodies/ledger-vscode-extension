@@ -4,7 +4,12 @@
 
 use std::collections::BTreeSet;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+use serde::Serialize;
+use ts_rs::TS;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, TS)]
+#[serde(rename_all = "lowercase")]
+#[ts(export)]
 pub enum NodeKind {
     Directory,
     File,
@@ -141,7 +146,9 @@ fn append(id: &mut String, separator: &str, segment: &str) {
     id.push_str(segment);
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, TS)]
+#[serde(rename_all = "lowercase")]
+#[ts(export)]
 pub enum CheckState {
     Unchecked,
     /// Some of the tests below the node are selected.
@@ -160,6 +167,18 @@ impl TestSelection {
         Self {
             selected: tree.tests().iter().map(|test| test.id.clone()).collect(),
         }
+    }
+
+    /// The tests with these ids, for restoring a saved selection.
+    pub fn from_ids(ids: impl IntoIterator<Item = String>) -> Self {
+        Self {
+            selected: ids.into_iter().collect(),
+        }
+    }
+
+    /// The ids of the selected tests, for saving the selection.
+    pub fn ids(&self) -> impl Iterator<Item = &str> {
+        self.selected.iter().map(String::as_str)
     }
 
     pub fn is_empty(&self) -> bool {
@@ -488,5 +507,16 @@ sub/test_deep.py::test_c
         selection.retain_existing(&after);
 
         assert_eq!(selection, TestSelection::all(&after));
+    }
+
+    #[test]
+    fn a_selection_is_restored_from_its_ids() {
+        let tree = tree();
+        let mut selection = TestSelection::default();
+        selection.set(node(&tree, "sub"), true);
+
+        let saved: Vec<String> = selection.ids().map(str::to_owned).collect();
+
+        assert_eq!(TestSelection::from_ids(saved), selection);
     }
 }

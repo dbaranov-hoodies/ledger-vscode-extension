@@ -9,6 +9,7 @@ use tokio::sync::mpsc;
 pub enum Source {
     /// The image, shared by the containers of an app.
     Image,
+    /// The container of a device, and what runs on the host for that device.
     Container(Device),
 }
 

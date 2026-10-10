@@ -2,20 +2,22 @@ use std::sync::Mutex;
 
 use ledger_core::Command;
 use ledger_core::Device;
+use ledger_core::actions::ContainerAction;
+use ledger_core::c_app::{self, MakefileInfo};
 use ledger_core::container::{
     self, ContainerState, Observation, ObservedContainer, Operation, Plan, Retries, Retry,
     Settings, Status,
 };
-use ledger_core::docker::{self, ContainerUser, CreateContainer, RunId};
+use ledger_core::docker::{self, ContainerUser, CreateContainer, RunId, RunMake};
 use ledger_core::platform::Platform;
-use ledger_core::task::{self, Job};
+use ledger_core::task::{self, Job, Step};
 use ledger_core::update::{self, CheckPolicy, Freshness, LastCheck};
 
 use crate::log::{Log, LogSender, Source};
 use crate::runner::{CommandRunner, Output, new_run_id};
 use crate::runs::ActiveRuns;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Config {
     pub image: String,
     /// Name of the app folder, which every container name starts with.
@@ -138,9 +140,13 @@ impl<R: CommandRunner> ContainerManager<R> {
 
     async fn run_checked(&self, source: Source, command: &Command) -> Result<Output, String> {
         let log = self.log(source);
+        self.check(command, log.as_ref()).await
+    }
+
+    async fn check(&self, command: &Command, log: Option<&Log>) -> Result<Output, String> {
         let output = self
             .runner
-            .run(command, log.as_ref())
+            .run(command, log)
             .await
             .map_err(|error| format!("{command}: {error}"))?;
         if output.success {
@@ -281,6 +287,41 @@ impl<R: CommandRunner> ContainerManager<R> {
         Ok(())
     }
 
+    /// Does what the user asked for the containers of `devices`, one container after the other.
+    /// A container with an active run is left alone.
+    pub async fn run_container_action(
+        &self,
+        action: ContainerAction,
+        devices: &[Device],
+        now: u64,
+    ) -> Result<(), String> {
+        let observation = self.observe(devices).await;
+        if !observation.docker_available {
+            return Err("Docker is not available".to_owned());
+        }
+        let mut operations = Vec::new();
+        match action {
+            ContainerAction::Update => operations.push(Operation::Pull),
+            ContainerAction::Create if !observation.image_present() => {
+                return Err(
+                    "the image is not there yet: update the containers to pull it".to_owned(),
+                );
+            }
+            ContainerAction::Create => {}
+        }
+        for &device in devices {
+            if self.runs.is_busy(device) {
+                self.note(
+                    Source::Container(device),
+                    "not replaced: a run is active in this container",
+                );
+            } else {
+                operations.push(Operation::Create(device));
+            }
+        }
+        self.execute(&operations, &observation, now).await
+    }
+
     async fn create(&self, device: Device, existing: ContainerState) -> Result<(), String> {
         let source = Source::Container(device);
         let name = self.container_name(device);
@@ -343,9 +384,12 @@ impl<R: CommandRunner> ContainerManager<R> {
 
     async fn run_job(&self, job: &Job) -> JobResult {
         let run_id = new_run_id();
-        let _active = self.runs.begin(job.device, run_id.clone());
+        let in_container = job.uses_container();
+        let _active = in_container.then(|| self.runs.begin(job.device, run_id.clone()));
         let outcome = self.run_steps(job, &run_id).await;
-        self.kill_run(job.device, &run_id).await;
+        if in_container {
+            self.kill_run(job.device, &run_id).await;
+        }
         JobResult {
             device: job.device,
             outcome,
@@ -356,11 +400,14 @@ impl<R: CommandRunner> ContainerManager<R> {
         let container = self.container_name(job.device);
         let source = Source::Container(job.device);
         for (index, step) in job.steps.iter().enumerate() {
-            let command = step.command(&container, self.config.user, run_id);
+            let command = match step {
+                Step::InContainer(step) => step.command(&container, self.config.user, run_id),
+                Step::OnHost(host) => host.command.clone(),
+            };
             let Err(reason) = self.run_checked(source.clone(), &command).await else {
                 continue;
             };
-            if !step.continue_on_error {
+            if !step.continue_on_error() {
                 return JobOutcome::Failed {
                     step: index,
                     reason,
@@ -372,6 +419,42 @@ impl<R: CommandRunner> ContainerManager<R> {
             );
         }
         JobOutcome::Succeeded
+    }
+
+    /// Asks the Makefile of the C app in `build_directory` for its name and variants. The image
+    /// must be local already, and the answer is not logged.
+    pub async fn makefile_info(&self, build_directory: &str) -> Result<MakefileInfo, String> {
+        let listing = self.make(build_directory, c_app::LIST_INFO_TARGET).await?;
+        let name = c_app::parse_app_name(&listing)
+            .ok_or_else(|| "make listinfo printed no APPNAME".to_owned())?;
+        // Older SDKs have no `listvariants`: the app has none then.
+        let variants = self
+            .make(build_directory, c_app::LIST_VARIANTS_TARGET)
+            .await
+            .ok()
+            .and_then(|listing| c_app::parse_variants(&listing));
+        Ok(MakefileInfo { name, variants })
+    }
+
+    /// The service to open a terminal in: the first one of the compose file, which is at `file`
+    /// on the host.
+    pub async fn compose_service(&self, file: &str) -> Result<String, String> {
+        let output = self.check(&docker::compose_services(file), None).await?;
+        docker::parse_first_service(&output.stdout)
+            .map(str::to_owned)
+            .ok_or_else(|| format!("{file} lists no service"))
+    }
+
+    async fn make(&self, build_directory: &str, target: &str) -> Result<String, String> {
+        let command = docker::run_make(&RunMake {
+            image: &self.config.image,
+            app_dir: &self.config.app_dir,
+            build_directory,
+            user: self.config.user,
+            target,
+        });
+        let output = self.check(&command, None).await?;
+        Ok(output.stdout)
     }
 
     /// Whether the registry has a newer image than the local one. `None` when either digest is
@@ -969,11 +1052,15 @@ mod tests {
 
     fn plan_for(task: Task, devices: &[Device], options: &Options) -> task::Plan {
         let app = App {
-            folder_name: "app-x".to_owned(),
+            folder: "/work/app-x".into(),
             language: Language::C,
             build_directory: "./".to_owned(),
             devices: vec![Device::Stax, Device::Flex],
             rust: None,
+            build_use_cases: Vec::new(),
+            test_suites: Vec::new(),
+            makefile: None,
+            compose_file: None,
         };
         let target = Target::new(devices.iter().copied()).unwrap();
         task::plan_task(task, &app, &target, options).unwrap()
@@ -1102,5 +1189,270 @@ mod tests {
 
         assert_eq!(freshness, Freshness::Outdated);
         assert_eq!(count(&docker, "docker buildx"), 0);
+    }
+
+    fn makefile_docker() -> FakeDocker {
+        FakeDocker::new()
+            .with_make_output(
+                "listinfo",
+                "make: Entering directory '/app'\nAPPNAME=Boilerplate\n",
+            )
+            .with_make_output("listvariants", "VARIANTS COIN BTC LTC\n")
+    }
+
+    #[tokio::test]
+    async fn the_makefile_is_asked_for_the_name_and_the_variants() {
+        let docker = makefile_docker();
+        let manager = ContainerManager::new(&docker, config());
+
+        let info = manager.makefile_info("./app").await.unwrap();
+
+        assert_eq!(info.name, "Boilerplate");
+        let variants = info.variants.unwrap();
+        assert_eq!(variants.name, "COIN");
+        assert_eq!(variants.values, ["BTC", "LTC"]);
+        assert_eq!(
+            docker.calls()[0],
+            "docker run --rm --pull never --user 1000:1000 -v /home/u/app-x:/app -w /app \
+             -e 'BOLOS_SDK=/opt/stax-secure-sdk' img:latest make -C ./app listinfo"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_app_without_variants_still_has_its_name() {
+        let docker = FakeDocker::new().with_make_output("listinfo", "APPNAME=Boilerplate\n");
+        let manager = ContainerManager::new(&docker, config());
+
+        let info = manager.makefile_info("./").await.unwrap();
+
+        assert_eq!(info.name, "Boilerplate");
+        assert_eq!(info.variants, None);
+    }
+
+    #[tokio::test]
+    async fn a_makefile_that_prints_no_name_is_an_error() {
+        let docker = FakeDocker::new().with_make_output("listinfo", "nothing useful\n");
+        let manager = ContainerManager::new(&docker, config());
+
+        let error = manager.makefile_info("./").await.unwrap_err();
+
+        assert!(error.contains("APPNAME"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn a_missing_image_is_reported_and_never_pulled() {
+        let docker = makefile_docker().without_image();
+        let manager = ContainerManager::new(&docker, config());
+
+        let error = manager.makefile_info("./").await.unwrap_err();
+
+        assert!(error.contains("Unable to find image"), "{error}");
+        assert_eq!(count(&docker, "docker pull"), 0);
+    }
+
+    #[tokio::test]
+    async fn asking_the_makefile_is_not_logged() {
+        let docker = makefile_docker();
+        let (sender, mut receiver) = log::channel();
+        let manager = ContainerManager::new(&docker, config()).with_logs(sender);
+
+        manager.makefile_info("./").await.unwrap();
+
+        assert!(drain(&mut receiver).is_empty());
+    }
+
+    fn host_plan(commands: &[&[&str]]) -> task::Plan {
+        let steps = commands
+            .iter()
+            .map(|argv| Step::on_host(Command::new(argv[0]).args(argv[1..].iter().copied())));
+        task::Plan {
+            jobs: vec![Job {
+                device: Device::Stax,
+                steps: steps.collect(),
+            }],
+            warnings: Vec::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn host_steps_run_on_the_host_and_leave_the_container_alone() {
+        let docker = FakeDocker::new();
+        let (sender, mut receiver) = log::channel();
+        let manager = ContainerManager::new(&docker, config()).with_logs(sender);
+        let plan = host_plan(&[&["python3", "-m", "venv", "/v"], &["/v/bin/python", "-V"]]);
+
+        let results = manager.run_plan(&plan).await;
+
+        assert_eq!(results[0].outcome, JobOutcome::Succeeded);
+        assert_eq!(docker.calls(), ["python3 -m venv /v", "/v/bin/python -V"]);
+        let events = drain(&mut receiver);
+        assert!(matches!(
+            &events[0],
+            LogEvent::Started { source: Source::Container(Device::Stax), command }
+                if command == "python3 -m venv /v"
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_host_step_that_fails_stops_the_job() {
+        let docker = FakeDocker::new().fail("pip install", 1);
+        let manager = ContainerManager::new(&docker, config());
+        let plan = host_plan(&[
+            &["python3", "-m", "venv", "/v"],
+            &["/v/bin/python", "-m", "pip", "install", "ledgerblue"],
+            &["/v/bin/python", "-m", "ledgerblue.runScript"],
+        ]);
+
+        let results = manager.run_plan(&plan).await;
+
+        assert!(matches!(
+            &results[0].outcome,
+            JobOutcome::Failed { step: 1, reason } if reason.contains("pip install")
+        ));
+        assert_eq!(docker.calls().len(), 2, "the load was not attempted");
+    }
+
+    #[tokio::test]
+    async fn a_device_job_on_the_host_does_not_make_the_container_busy() {
+        let docker = FakeDocker::new();
+        let manager = ContainerManager::new(&docker, config());
+        let plan = host_plan(&[&["python3", "-V"]]);
+
+        manager.run_plan(&plan).await;
+
+        assert_eq!(count(&docker, "docker"), 0, "no cleanup in the container");
+    }
+
+    #[tokio::test]
+    async fn the_compose_service_is_the_first_one_the_file_lists() {
+        let docker = FakeDocker::new().with_compose_services("builder\ndb\n");
+        let manager = ContainerManager::new(&docker, config());
+
+        let service = manager
+            .compose_service("/home/u/app-x/docker-compose.yml")
+            .await;
+
+        assert_eq!(service, Ok("builder".to_owned()));
+        assert_eq!(
+            docker.calls(),
+            ["docker compose -f /home/u/app-x/docker-compose.yml config --services"]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_missing_compose_file_or_one_without_services_is_an_error() {
+        let missing = FakeDocker::new();
+        let empty = FakeDocker::new().with_compose_services("\n");
+
+        let no_file = ContainerManager::new(&missing, config())
+            .compose_service("/w/docker-compose.yml")
+            .await;
+        let no_service = ContainerManager::new(&empty, config())
+            .compose_service("/w/docker-compose.yml")
+            .await;
+
+        assert!(no_file.unwrap_err().contains("configuration file"));
+        assert!(no_service.unwrap_err().contains("lists no service"));
+    }
+
+    #[tokio::test]
+    async fn updating_pulls_the_image_and_creates_the_containers_again() {
+        let docker = newer_registry(FakeDocker::new())
+            .with_container(STAX, "running")
+            .with_container(FLEX, "exited");
+        let manager = ContainerManager::new(&docker, config());
+
+        let result = manager
+            .run_container_action(ContainerAction::Update, &[Device::Stax, Device::Flex], NOW)
+            .await;
+
+        assert_eq!(result, Ok(()));
+        assert!(position(&docker, "docker pull") < position(&docker, "docker run"));
+        assert_eq!(count(&docker, "docker pull"), 1);
+        assert_eq!(count(&docker, "docker run"), 2);
+        assert_eq!(
+            docker.container_image(STAX).as_deref(),
+            Some("sha256:image2")
+        );
+        assert_eq!(
+            docker.container_image(FLEX).as_deref(),
+            Some("sha256:image2")
+        );
+    }
+
+    #[tokio::test]
+    async fn creating_uses_the_image_that_is_there_without_pulling() {
+        let docker = FakeDocker::new().with_container(STAX, "running");
+        let manager = ContainerManager::new(&docker, config());
+
+        let result = manager
+            .run_container_action(ContainerAction::Create, &[Device::Stax], NOW)
+            .await;
+
+        assert_eq!(result, Ok(()));
+        assert_eq!(count(&docker, "docker pull"), 0);
+        assert_eq!(count(&docker, "docker run"), 1);
+        assert_eq!(docker.container_status(STAX), Some("running"));
+    }
+
+    #[tokio::test]
+    async fn creating_without_an_image_is_an_error_and_changes_nothing() {
+        let docker = FakeDocker::new()
+            .without_image()
+            .with_container(STAX, "running");
+        let manager = ContainerManager::new(&docker, config());
+
+        let result = manager
+            .run_container_action(ContainerAction::Create, &[Device::Stax], NOW)
+            .await;
+
+        assert!(result.unwrap_err().contains("update the containers"));
+        assert_eq!(mutations(&docker), 0);
+    }
+
+    #[tokio::test]
+    async fn without_docker_a_container_action_is_an_error() {
+        let docker = FakeDocker::new().docker_down();
+        let manager = ContainerManager::new(&docker, config());
+
+        let result = manager
+            .run_container_action(ContainerAction::Update, &[Device::Stax], NOW)
+            .await;
+
+        assert!(result.unwrap_err().contains("Docker is not available"));
+        assert_eq!(mutations(&docker), 0);
+    }
+
+    #[tokio::test]
+    async fn a_container_with_an_active_run_is_not_replaced() {
+        let docker = FakeDocker::new()
+            .with_container(STAX, "running")
+            .with_container(FLEX, "running");
+        let (sender, mut receiver) = log::channel();
+        let manager = ContainerManager::new(&docker, config()).with_logs(sender);
+        let _active = manager
+            .runs()
+            .begin(Device::Stax, RunId::new("run1").unwrap());
+
+        let result = manager
+            .run_container_action(ContainerAction::Create, &[Device::Stax, Device::Flex], NOW)
+            .await;
+
+        assert_eq!(result, Ok(()));
+        assert_eq!(count(&docker, "docker run"), 1, "only the idle one");
+        let notes: Vec<_> = drain(&mut receiver)
+            .into_iter()
+            .filter_map(|event| match event {
+                LogEvent::Note { source, text } => Some((source, text)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            notes,
+            [(
+                Source::Container(Device::Stax),
+                "not replaced: a run is active in this container".to_owned()
+            )]
+        );
     }
 }

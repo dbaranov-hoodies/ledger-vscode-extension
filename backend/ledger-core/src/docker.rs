@@ -10,6 +10,10 @@ use crate::platform::Platform;
 const LOCAL_TIMEOUT: Duration = Duration::from_secs(10);
 /// Asking the registry crosses the network.
 const REGISTRY_TIMEOUT: Duration = Duration::from_secs(20);
+/// Starting a container to ask `make` a question takes a few seconds at most.
+const MAKE_TIMEOUT: Duration = Duration::from_secs(30);
+/// The SDK to build with when the answer does not depend on the device.
+const ANY_SDK: &str = "/opt/stax-secure-sdk";
 
 /// Environment variable that tags every process of one run, so the run can be found and killed.
 pub const RUN_ID_ENV: &str = "LEDGER_RUN_ID";
@@ -188,6 +192,45 @@ pub fn create_container(spec: &CreateContainer) -> Command {
         ])
 }
 
+/// Lists the services of a compose file, one per line.
+pub fn compose_services(file: &str) -> Command {
+    docker(["compose", "-f", file, "config", "--services"]).timeout(LOCAL_TIMEOUT)
+}
+
+/// Runs a service of a compose file in a container that is removed afterwards.
+pub fn compose_run(file: &str, user: ContainerUser, service: &str) -> Command {
+    docker(["compose", "-f", file, "run", "--rm", "--remove-orphans"])
+        .args(user.args())
+        .arg(service)
+}
+
+/// The first service that [`compose_services`] lists.
+pub fn parse_first_service(output: &str) -> Option<&str> {
+    output.lines().map(str::trim).find(|line| !line.is_empty())
+}
+
+pub struct RunMake<'a> {
+    pub image: &'a str,
+    /// Host path of the app folder, mounted at `/app`.
+    pub app_dir: &'a str,
+    /// Relative to the app folder, where `make` runs.
+    pub build_directory: &'a str,
+    pub user: ContainerUser,
+    pub target: &'a str,
+}
+
+/// Runs `make <target>` for a C app in a container that is removed afterwards, so the app's own
+/// containers are not needed. The image must be there already: nothing is pulled.
+pub fn run_make(spec: &RunMake) -> Command {
+    docker(["run", "--rm", "--pull", "never"])
+        .args(spec.user.args())
+        .args(["-v".to_owned(), format!("{}:/app", spec.app_dir)])
+        .args(["-w", "/app", "-e"])
+        .arg(format!("BOLOS_SDK={ANY_SDK}"))
+        .args([spec.image, "make", "-C", spec.build_directory, spec.target])
+        .timeout(MAKE_TIMEOUT)
+}
+
 /// Runs a command in a container, tagging its processes with the run id so that
 /// [`kill_run`] can find them. `tty` is for commands the user types into.
 pub fn exec_tagged(
@@ -279,6 +322,69 @@ mod tests {
             platform: Platform::Linux,
             display,
         }
+    }
+
+    #[test]
+    fn a_compose_file_is_asked_for_its_services_and_run_as_the_host_user() {
+        let user = ContainerUser::Host {
+            uid: 1000,
+            gid: 1001,
+        };
+
+        assert_eq!(
+            compose_services("/w/docker-compose.yml").shell_line(),
+            "docker compose -f /w/docker-compose.yml config --services"
+        );
+        assert_eq!(
+            compose_run("/w/docker-compose.yml", user, "builder").shell_line(),
+            "docker compose -f /w/docker-compose.yml run --rm --remove-orphans --user 1000:1001 builder"
+        );
+    }
+
+    #[test]
+    fn the_first_service_is_the_first_line_that_is_not_empty() {
+        assert_eq!(parse_first_service("\n app \nother\n"), Some("app"));
+        assert_eq!(parse_first_service(""), None);
+        assert_eq!(parse_first_service("  \n"), None);
+    }
+
+    #[test]
+    fn make_runs_in_the_build_directory_of_a_throwaway_container_without_pulling() {
+        let command = run_make(&RunMake {
+            image: "img:latest",
+            app_dir: "/home/u/app-x",
+            build_directory: "./app",
+            user: ContainerUser::Host {
+                uid: 1000,
+                gid: 1001,
+            },
+            target: "listinfo",
+        });
+
+        assert_eq!(command.program, "docker");
+        assert_eq!(
+            command.args,
+            [
+                "run",
+                "--rm",
+                "--pull",
+                "never",
+                "--user",
+                "1000:1001",
+                "-v",
+                "/home/u/app-x:/app",
+                "-w",
+                "/app",
+                "-e",
+                "BOLOS_SDK=/opt/stax-secure-sdk",
+                "img:latest",
+                "make",
+                "-C",
+                "./app",
+                "listinfo",
+            ]
+        );
+        assert_eq!(command.timeout, Some(MAKE_TIMEOUT));
     }
 
     #[test]

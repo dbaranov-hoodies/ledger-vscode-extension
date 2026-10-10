@@ -57,10 +57,15 @@ impl Target {
         self.devices.len() > 1
     }
 
+    /// Whether this is every device of an app that supports several.
+    pub fn is_all(&self, compatible: &[Device]) -> bool {
+        let supported: BTreeSet<Device> = compatible.iter().copied().collect();
+        self.is_multiple() && self.devices == supported
+    }
+
     /// Text for the status bar and the UI: `All`, or the device names.
     pub fn label(&self, compatible: &[Device]) -> String {
-        let supported: BTreeSet<Device> = compatible.iter().copied().collect();
-        if self.is_multiple() && self.devices == supported {
+        if self.is_all(compatible) {
             return Self::ALL_LABEL.to_owned();
         }
         let names: Vec<_> = self
@@ -69,15 +74,6 @@ impl Target {
             .map(|device| device.spec().display_name)
             .collect();
         names.join(", ")
-    }
-
-    /// Reads a value of the existing `selectedDevice` setting: `All` or a device display name.
-    pub fn from_legacy_setting(value: &str, compatible: &[Device]) -> Option<Self> {
-        if value == Self::ALL_LABEL {
-            Self::all(compatible)
-        } else {
-            Device::from_display_name(value).map(Self::one)
-        }
     }
 
     /// Keeps the devices the app supports. If none is left, falls back to the app's first
@@ -212,16 +208,9 @@ mod tests {
     }
 
     #[test]
-    fn legacy_settings_are_read_back() {
-        assert_eq!(
-            Target::from_legacy_setting("All", &FIVE),
-            Target::all(&FIVE)
-        );
-        assert_eq!(
-            Target::from_legacy_setting("Nano S Plus", &FIVE),
-            Some(Target::one(Device::NanoSPlus))
-        );
-        assert_eq!(Target::from_legacy_setting("all", &FIVE), None);
-        assert_eq!(Target::from_legacy_setting("Nano", &FIVE), None);
+    fn all_is_every_device_of_an_app_that_has_several() {
+        assert!(Target::all(&FIVE).unwrap().is_all(&FIVE));
+        assert!(!target(&[Device::Flex, Device::ApexP]).is_all(&FIVE));
+        assert!(!Target::one(Device::Stax).is_all(&[Device::Stax]));
     }
 }

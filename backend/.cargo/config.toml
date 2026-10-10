@@ -1,0 +1,3 @@
+# Where `cargo test` writes the TypeScript types of the Rust types that derive `TS`.
+[env]
+TS_RS_EXPORT_DIR = { value = "../src/generated", relative = true }

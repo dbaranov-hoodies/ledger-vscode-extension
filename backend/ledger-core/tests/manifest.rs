@@ -1,11 +1,11 @@
 use ledger_core::manifest::{
-    self, LegacyManifest, Manifest, ParsedManifest, TestDependency, TestSuite, UseCaseOrigin,
+    self, AppManifest, LegacyManifest, ParsedManifest, TestDependency, TestSuite, UseCaseOrigin,
 };
 use ledger_core::{Device, Error, Language};
 
 const BOILERPLATE: &str = include_str!("fixtures/boilerplate_c.toml");
 
-fn current(source: &str) -> Manifest {
+fn current(source: &str) -> AppManifest {
     match manifest::parse(source).expect("manifest should parse") {
         ParsedManifest::Current(manifest) => manifest,
         ParsedManifest::Legacy(_) => panic!("expected a current manifest"),
@@ -21,7 +21,7 @@ fn app(extra: &str) -> String {
     format!("[app]\nsdk = \"C\"\nbuild_directory = \"./\"\ndevices = [\"nanox\"]\n{extra}")
 }
 
-fn use_cases(manifest: &Manifest) -> Vec<(&str, UseCaseOrigin)> {
+fn use_cases(manifest: &AppManifest) -> Vec<(&str, UseCaseOrigin)> {
     manifest
         .build_use_cases
         .iter()
@@ -29,11 +29,11 @@ fn use_cases(manifest: &Manifest) -> Vec<(&str, UseCaseOrigin)> {
         .collect()
 }
 
-fn suite<'a>(manifest: &'a Manifest, name: &str) -> &'a TestSuite {
+fn suite<'a>(manifest: &'a AppManifest, name: &str) -> &'a TestSuite {
     manifest.test_suite(name).expect("suite should exist")
 }
 
-fn suite_names(manifest: &Manifest) -> Vec<&str> {
+fn suite_names(manifest: &AppManifest) -> Vec<&str> {
     manifest
         .test_suites
         .iter()

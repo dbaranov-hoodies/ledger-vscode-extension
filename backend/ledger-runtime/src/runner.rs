@@ -36,8 +36,19 @@ impl<T: CommandRunner + Sync> CommandRunner for &T {
     }
 }
 
+impl<T: CommandRunner + Send + Sync> CommandRunner for std::sync::Arc<T> {
+    fn run(
+        &self,
+        command: &Command,
+        log: Option<&Log>,
+    ) -> impl Future<Output = io::Result<Output>> + Send {
+        (**self).run(command, log)
+    }
+}
+
 /// Starts a real process. Dropping the future kills the process, and so does the command's
 /// timeout.
+#[derive(Debug, Clone, Copy, Default)]
 pub struct SystemRunner;
 
 impl CommandRunner for SystemRunner {

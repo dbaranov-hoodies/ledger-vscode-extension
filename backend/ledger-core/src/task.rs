@@ -1,7 +1,7 @@
 //! What each action of the extension runs, as commands for the containers of a target.
 //!
-//! A [`Plan`] has one [`Job`] per device. The jobs are independent and run side by side, each in
-//! the container of its device, and the steps of a job run one after the other.
+//! A [`Plan`] has one [`Job`] per device. The jobs are independent and run side by side, each for
+//! its device, and the steps of a job run one after the other.
 
 use std::collections::BTreeSet;
 
@@ -10,10 +10,13 @@ use thiserror::Error;
 use crate::app::{App, join_path};
 use crate::command::Command;
 use crate::device::Device;
+use crate::device_ops::{self, DeviceSettings, DeviceTask};
 use crate::docker::{self, ContainerUser, RunId};
+use crate::host_python::{HostPython, path_text};
 use crate::language::Language;
 use crate::manifest::{BuildUseCase, UseCaseOrigin};
 use crate::target::Target;
+use crate::test_deps::{self, TestDependencies};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Task {
@@ -27,6 +30,15 @@ pub enum Task {
     RunTests(TestMode),
     EnforcerChecks,
     OpenTerminal,
+    /// On a physical device, which only one device of the target can be.
+    Device(DeviceTask),
+    /// A terminal in the service of the app's `docker-compose.yml`.
+    ComposeTerminal,
+    /// Clones and builds the apps the tests of a suite need, with the scripts of the suite.
+    /// `clean` throws away what was prepared before.
+    PrepareTestDependencies {
+        clean: bool,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -54,6 +66,14 @@ pub struct TestRun {
     pub paths: Vec<String>,
 }
 
+/// How to run the compose file of the app.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ComposeRun {
+    /// One of the services that `docker compose config --services` lists.
+    pub service: String,
+    pub user: ContainerUser,
+}
+
 /// What the user chose, beyond the target.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Options {
@@ -66,6 +86,12 @@ pub struct Options {
     pub tests: Option<TestRun>,
     /// A shell command to run before the tests, to install what they need.
     pub test_requirements: Option<String>,
+    /// Needed by the actions on a physical device.
+    pub device: Option<DeviceSettings>,
+    /// The Python environment of the host, for what runs there.
+    pub host: Option<HostPython>,
+    pub compose: Option<ComposeRun>,
+    pub test_dependencies: Option<TestDependencies>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
@@ -78,19 +104,97 @@ pub enum PlanError {
     MissingRustPackage,
     #[error("the app has no functional tests")]
     NoTests,
+    #[error("the settings of the actions on a physical device are missing")]
+    NoDeviceSettings,
+    #[error("actions on a {0:?} are turned off in the settings")]
+    DeviceActionsOff(Device),
+    #[error("the name of the app is not known yet")]
+    UnknownAppName,
+    #[error("this action runs on the host, and its Python environment is missing")]
+    NoHostPython,
+    #[error("the app has no docker-compose.yml")]
+    NoComposeFile,
+    #[error("the service of the compose file to run is missing")]
+    NoComposeService,
+    #[error("the test suite to prepare is missing")]
+    NoTestDependencies,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Plan {
     pub jobs: Vec<Job>,
+    pub warnings: Vec<Warning>,
+}
+
+/// Something to tell the user before the plan runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Warning {
+    /// The device is set up with a seed that everyone knows.
+    DefaultOnboardingSeed,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Job {
     pub device: Device,
-    /// Run in the container of the device, in order. The job stops at the first step that fails,
-    /// unless that step keeps going.
-    pub steps: Vec<InContainer>,
+    /// Run in order. The job stops at the first step that fails, unless that step keeps going.
+    pub steps: Vec<Step>,
+}
+
+impl Job {
+    /// Whether any step runs in the container of the device.
+    pub fn uses_container(&self) -> bool {
+        self.steps
+            .iter()
+            .any(|step| matches!(step, Step::InContainer(_)))
+    }
+}
+
+/// One thing to run for a device.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Step {
+    InContainer(InContainer),
+    OnHost(OnHost),
+}
+
+impl Step {
+    pub fn on_host(command: Command) -> Self {
+        Self::OnHost(OnHost::new(command))
+    }
+
+    pub fn continue_on_error(&self) -> bool {
+        match self {
+            Self::InContainer(step) => step.continue_on_error,
+            Self::OnHost(_) => false,
+        }
+    }
+}
+
+/// A command to run on the machine the extension runs on, as Git and a physical device need.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OnHost {
+    pub command: Command,
+    /// The command is typed into, as a shell is.
+    pub tty: bool,
+}
+
+impl OnHost {
+    pub fn new(command: Command) -> Self {
+        Self {
+            command,
+            tty: false,
+        }
+    }
+
+    pub fn tty(mut self) -> Self {
+        self.tty = true;
+        self
+    }
+}
+
+impl From<InContainer> for Step {
+    fn from(step: InContainer) -> Self {
+        Self::InContainer(step)
+    }
 }
 
 /// Runs `bash` with these arguments: the SDK to use, the directory to go to, whether to use the
@@ -118,6 +222,8 @@ pub struct InContainer {
     pub tty: bool,
     /// The job goes on when this step fails.
     pub continue_on_error: bool,
+    /// What to show instead of the program and its arguments, when they hold a secret.
+    pub label: Option<String>,
 }
 
 impl InContainer {
@@ -135,6 +241,7 @@ impl InContainer {
             venv: false,
             tty: false,
             continue_on_error: false,
+            label: None,
         }
     }
 
@@ -163,6 +270,11 @@ impl InContainer {
         self
     }
 
+    pub fn label(mut self, label: impl Into<String>) -> Self {
+        self.label = Some(label.into());
+        self
+    }
+
     /// The `docker exec` that runs this step, its processes tagged with the run id.
     pub fn command(&self, container: &str, user: ContainerUser, run_id: &RunId) -> Command {
         let sdk = self
@@ -178,8 +290,11 @@ impl InContainer {
             .collect();
         script.extend([sdk, dir, venv.to_owned()]);
         script.extend(self.argv.iter().cloned());
-        docker::exec_tagged(container, user, run_id, self.tty, &script)
-            .label(shell_words::join(&self.argv))
+        let label = match &self.label {
+            Some(label) => label.clone(),
+            None => shell_words::join(&self.argv),
+        };
+        docker::exec_tagged(container, user, run_id, self.tty, &script).label(label)
     }
 }
 
@@ -208,12 +323,12 @@ pub fn plan_task(
                 Ok(vec![make(app, Some(device), ["clean_target"])])
             })?
         }
-        Task::CleanAllBuilds => one_container(&devices, clean_all(app)),
+        Task::CleanAllBuilds => run_once(&devices, clean_all(app)),
         Task::UpdateRustSdk => {
             require(task, app, Language::Rust)?;
             let update = InContainer::new(["cargo", "update", "ledger_device_sdk"])
                 .in_dir(&app.build_directory);
-            one_container(&devices, vec![update])
+            run_once(&devices, vec![update])
         }
         Task::RunEmulator => per_device(&devices, |device| Ok(vec![run_emulator(app, device)]))?,
         Task::KillEmulator => per_device(&devices, |_| {
@@ -227,8 +342,36 @@ pub fn plan_task(
         Task::OpenTerminal => per_device(&devices, |device| {
             Ok(vec![InContainer::new(["bash"]).sdk(device).tty()])
         })?,
+        Task::Device(device_task) => {
+            let settings = options.device.as_ref().ok_or(PlanError::NoDeviceSettings)?;
+            let host = options.host.as_ref().ok_or(PlanError::NoHostPython)?;
+            single_device(task, target, |device| {
+                device_ops::steps(device_task, app, device, settings, host)
+            })?
+        }
+        Task::ComposeTerminal => {
+            let file = app.compose_file.as_ref().ok_or(PlanError::NoComposeFile)?;
+            let run = options
+                .compose
+                .as_ref()
+                .ok_or(PlanError::NoComposeService)?;
+            let file = path_text(&app.folder.join(file));
+            let command = docker::compose_run(&file, run.user, &run.service);
+            run_once(&devices, vec![Step::OnHost(OnHost::new(command).tty())])
+        }
+        Task::PrepareTestDependencies { clean } => {
+            let dependencies = options
+                .test_dependencies
+                .as_ref()
+                .ok_or(PlanError::NoTestDependencies)?;
+            let host = options.host.as_ref().ok_or(PlanError::NoHostPython)?;
+            run_once(&devices, test_deps::steps(dependencies, clean, app, host))
+        }
     };
-    Ok(Plan { jobs })
+    Ok(Plan {
+        jobs,
+        warnings: device_ops::warnings(task, options),
+    })
 }
 
 fn require(task: Task, app: &App, language: Language) -> Result<(), PlanError> {
@@ -239,38 +382,38 @@ fn require(task: Task, app: &App, language: Language) -> Result<(), PlanError> {
     }
 }
 
-fn per_device(
+fn per_device<S: Into<Step>>(
     devices: &[Device],
-    steps: impl Fn(Device) -> Result<Vec<InContainer>, PlanError>,
+    steps: impl Fn(Device) -> Result<Vec<S>, PlanError>,
 ) -> Result<Vec<Job>, PlanError> {
     devices
         .iter()
         .map(|&device| {
             Ok(Job {
                 device,
-                steps: steps(device)?,
+                steps: steps(device)?.into_iter().map(Into::into).collect(),
             })
         })
         .collect()
 }
 
-/// For actions that are not about a device: run once, in the container of the first device.
-fn one_container(devices: &[Device], steps: Vec<InContainer>) -> Vec<Job> {
+/// For actions that are not about a device: run once, for the first device.
+fn run_once<S: Into<Step>>(devices: &[Device], steps: Vec<S>) -> Vec<Job> {
     vec![Job {
         device: devices[0],
-        steps,
+        steps: steps.into_iter().map(Into::into).collect(),
     }]
 }
 
-fn single_device(
+fn single_device<S: Into<Step>>(
     task: Task,
     target: &Target,
-    steps: impl FnOnce(Device) -> Result<Vec<InContainer>, PlanError>,
+    steps: impl FnOnce(Device) -> Result<Vec<S>, PlanError>,
 ) -> Result<Vec<Job>, PlanError> {
     let device = target.single().ok_or(PlanError::NeedsOneDevice(task))?;
     Ok(vec![Job {
         device,
-        steps: steps(device)?,
+        steps: steps(device)?.into_iter().map(Into::into).collect(),
     }])
 }
 
@@ -437,13 +580,13 @@ fn enforcer(app: &App, devices: &[Device], target: &Target, options: &Options) -
     };
 
     if whole_app {
-        one_container(devices, vec![check(devices[0], false)])
+        run_once(devices, vec![check(devices[0], false)])
     } else {
         devices
             .iter()
             .map(|&device| Job {
                 device,
-                steps: vec![check(device, true)],
+                steps: vec![check(device, true).into()],
             })
             .collect()
     }
@@ -457,7 +600,7 @@ mod tests {
 
     fn app(language: Language, devices: &[Device]) -> App {
         App {
-            folder_name: "app-x".to_owned(),
+            folder: "/work/app-x".into(),
             language,
             build_directory: "./".to_owned(),
             devices: devices.to_vec(),
@@ -465,6 +608,10 @@ mod tests {
                 package_name: "app-x-rust".to_owned(),
                 app_name: "X".to_owned(),
             }),
+            build_use_cases: Vec::new(),
+            test_suites: Vec::new(),
+            makefile: None,
+            compose_file: None,
         }
     }
 
@@ -499,7 +646,7 @@ mod tests {
                 let steps = job
                     .steps
                     .iter()
-                    .map(|step| step.argv.iter().map(String::as_str).collect())
+                    .map(|step| container(step).argv.iter().map(String::as_str).collect())
                     .collect();
                 (job.device, steps)
             })
@@ -509,7 +656,16 @@ mod tests {
     fn only_step(plan: &Plan) -> &InContainer {
         assert_eq!(plan.jobs.len(), 1, "{plan:?}");
         assert_eq!(plan.jobs[0].steps.len(), 1, "{plan:?}");
-        &plan.jobs[0].steps[0]
+        container(&plan.jobs[0].steps[0])
+    }
+
+    fn container(step: &Step) -> &InContainer {
+        match step {
+            Step::InContainer(step) => step,
+            Step::OnHost(host) => {
+                panic!("a step in a container, not on the host: {}", host.command)
+            }
+        }
     }
 
     fn tests_options(paths: &[&str]) -> Options {
@@ -538,8 +694,8 @@ mod tests {
                 (Device::Flex, vec![vec!["make", "-C", "./", "-j"]]),
             ]
         );
-        assert_eq!(plan.jobs[0].steps[0].sdk, Some(Device::Stax));
-        assert_eq!(plan.jobs[1].steps[0].sdk, Some(Device::Flex));
+        assert_eq!(container(&plan.jobs[0].steps[0]).sdk, Some(Device::Stax));
+        assert_eq!(container(&plan.jobs[1].steps[0]).sdk, Some(Device::Flex));
     }
 
     #[test]
@@ -628,7 +784,7 @@ mod tests {
             plan.jobs[0]
                 .steps
                 .iter()
-                .all(|s| s.dir.as_deref() == Some("./"))
+                .all(|s| container(s).dir.as_deref() == Some("./"))
         );
     }
 
@@ -796,7 +952,7 @@ mod tests {
         assert!(
             plan.jobs
                 .iter()
-                .all(|job| job.steps[0].argv == ["pkill", "-f", "speculos"])
+                .all(|job| container(&job.steps[0]).argv == ["pkill", "-f", "speculos"])
         );
     }
 
@@ -809,7 +965,7 @@ mod tests {
             &tests_options(&[]),
         );
 
-        let steps = &plan.jobs[0].steps;
+        let steps: Vec<&InContainer> = plan.jobs[0].steps.iter().map(container).collect();
         assert_eq!(steps.len(), 2);
         assert_eq!(
             steps[0].argv,
@@ -850,7 +1006,7 @@ mod tests {
 
         assert_eq!(plan.jobs.len(), 2);
         for job in &plan.jobs {
-            let pytest = &job.steps.last().unwrap().argv;
+            let pytest = &container(job.steps.last().unwrap()).argv;
             assert_eq!(pytest[..3], ["pytest", paths[0], paths[1]]);
             assert_eq!(
                 pytest[pytest.len() - 2..],
@@ -867,7 +1023,7 @@ mod tests {
                 ..tests_options(&[])
             };
             let plan = plan(Task::RunTests(mode), &c_app(), &[Device::Stax], &options);
-            plan.jobs[0].steps.last().unwrap().argv[5..].to_vec()
+            container(plan.jobs[0].steps.last().unwrap()).argv[5..].to_vec()
         };
 
         assert_eq!(flags(TestMode::Headless, false), ["--device", "stax"]);
@@ -900,7 +1056,7 @@ mod tests {
             &options,
         );
 
-        let first = &plan.jobs[0].steps[0];
+        let first = container(&plan.jobs[0].steps[0]);
         assert_eq!(first.argv, ["bash", "-c", "pip install extra"]);
         assert!(first.continue_on_error && first.venv);
         assert_eq!(plan.jobs[0].steps.len(), 3);
@@ -992,9 +1148,10 @@ mod tests {
 
         assert_eq!(plan.jobs.len(), 2);
         for job in &plan.jobs {
-            assert_eq!(job.steps[0].argv, ["bash"]);
-            assert!(job.steps[0].tty);
-            assert_eq!(job.steps[0].sdk, Some(job.device));
+            let shell = container(&job.steps[0]);
+            assert_eq!(shell.argv, ["bash"]);
+            assert!(shell.tty);
+            assert_eq!(shell.sdk, Some(job.device));
         }
     }
 
@@ -1117,5 +1274,78 @@ mod tests {
 
         assert!(ok);
         assert_eq!(out, "a b|$HOME|it's||");
+    }
+
+    #[test]
+    fn the_tests_run_from_the_app_folder_as_the_swap_suites_expect() {
+        let plan = plan(
+            Task::RunTests(TestMode::Headless),
+            &c_app(),
+            &[Device::Stax],
+            &tests_options(&[]),
+        );
+
+        assert!(
+            plan.jobs[0]
+                .steps
+                .iter()
+                .all(|step| container(step).dir.is_none())
+        );
+    }
+
+    fn compose_app() -> App {
+        App {
+            compose_file: Some("docker/docker-compose.yml".to_owned()),
+            ..c_app()
+        }
+    }
+
+    fn compose_options() -> Options {
+        Options {
+            compose: Some(ComposeRun {
+                service: "builder".to_owned(),
+                user: ContainerUser::Host {
+                    uid: 1000,
+                    gid: 1000,
+                },
+            }),
+            ..Options::default()
+        }
+    }
+
+    #[test]
+    fn the_compose_terminal_is_typed_into_and_runs_on_the_host_once() {
+        let plan = plan(
+            Task::ComposeTerminal,
+            &compose_app(),
+            &[Device::Stax, Device::Flex],
+            &compose_options(),
+        );
+
+        assert_eq!(plan.jobs.len(), 1);
+        let Step::OnHost(host) = &plan.jobs[0].steps[0] else {
+            panic!("{plan:?}")
+        };
+        assert!(host.tty);
+        assert_eq!(
+            host.command.shell_line(),
+            "docker compose -f /work/app-x/docker/docker-compose.yml run --rm --remove-orphans --user 1000:1000 builder"
+        );
+    }
+
+    #[test]
+    fn the_compose_terminal_needs_a_compose_file_and_a_service() {
+        let target = target(&[Device::Stax]);
+
+        let no_file = plan_task(Task::ComposeTerminal, &c_app(), &target, &compose_options());
+        let no_service = plan_task(
+            Task::ComposeTerminal,
+            &compose_app(),
+            &target,
+            &Options::default(),
+        );
+
+        assert_eq!(no_file.unwrap_err(), PlanError::NoComposeFile);
+        assert_eq!(no_service.unwrap_err(), PlanError::NoComposeService);
     }
 }

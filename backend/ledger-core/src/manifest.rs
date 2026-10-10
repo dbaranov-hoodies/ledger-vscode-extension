@@ -11,13 +11,13 @@ use crate::language::Language;
 /// A manifest of either format, told apart by its content.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ParsedManifest {
-    Current(Manifest),
+    Current(AppManifest),
     Legacy(LegacyManifest),
 }
 
 /// The current manifest format.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Manifest {
+pub struct AppManifest {
     pub language: Language,
     pub build_directory: String,
     pub devices: Vec<Device>,
@@ -86,10 +86,10 @@ pub fn parse(source: &str) -> Result<ParsedManifest> {
             cargo_manifest_path,
         }));
     }
-    Manifest::from_raw(raw).map(ParsedManifest::Current)
+    AppManifest::from_raw(raw).map(ParsedManifest::Current)
 }
 
-impl Manifest {
+impl AppManifest {
     /// The suite that the legacy `[tests]` table describes.
     pub const STANDALONE_SUITE: &'static str = "standalone";
 
@@ -150,12 +150,12 @@ fn fold_legacy_tests(
     }
     let index = suites
         .iter()
-        .position(|suite| suite.name == Manifest::STANDALONE_SUITE)
+        .position(|suite| suite.name == AppManifest::STANDALONE_SUITE)
         .unwrap_or_else(|| {
             suites.insert(
                 0,
                 TestSuite {
-                    name: Manifest::STANDALONE_SUITE.to_owned(),
+                    name: AppManifest::STANDALONE_SUITE.to_owned(),
                     directory: None,
                     use_cases: Vec::new(),
                 },

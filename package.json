@@ -181,6 +181,16 @@
           "default": false,
           "markdownDescription": "Allow device operations on Nano X (requires special development device)"
         },
+        "ledgerDevTools.useRustBackend": {
+          "type": "boolean",
+          "default": false,
+          "markdownDescription": "Experimental: use the Rust backend (a sidecar process) instead of the TypeScript one. Reload the window to apply."
+        },
+        "ledgerDevTools.sidecarPath": {
+          "type": "string",
+          "default": "",
+          "markdownDescription": "Path of the Rust backend executable. Leave empty to use the one that comes with the extension, or the one built in `backend/target`."
+        },
         "ledgerDevTools.appSettings": {
           "type": "object",
           "scope": "resource",
@@ -315,6 +325,7 @@
   },
   "scripts": {
     "vscode:prepublish": "npm run package",
+    "build:sidecar": "cargo build --manifest-path backend/Cargo.toml -p ledger-sidecar",
     "compile": "webpack",
     "watch": "webpack --watch",
     "package": "webpack --mode production --devtool hidden-source-map",

@@ -12,6 +12,7 @@ pub const FIRST_IMAGE: &str = "sha256:image1";
 
 /// A tiny in-memory Docker. It answers the commands of the container lifecycle, changes its
 /// containers accordingly, records every command it was given, and logs like a real runner.
+/// A command for the host, which is not `docker`, is recorded and succeeds.
 pub struct FakeDocker {
     state: Mutex<State>,
 }
@@ -29,6 +30,16 @@ struct State {
     failures: Vec<(String, u32)>,
     repo_digest: Option<String>,
     remote_manifest: Option<String>,
+    /// What `make <target>` prints in a throwaway container.
+    make_outputs: BTreeMap<String, String>,
+    /// What `docker compose config --services` prints, when there is a compose file.
+    compose_services: Option<String>,
+}
+
+impl Default for FakeDocker {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl FakeDocker {
@@ -43,6 +54,8 @@ impl FakeDocker {
                 failures: Vec::new(),
                 repo_digest: None,
                 remote_manifest: None,
+                make_outputs: BTreeMap::new(),
+                compose_services: None,
             }),
         }
     }
@@ -98,6 +111,20 @@ impl FakeDocker {
         let state = self.state_mut();
         state.repo_digest = repo_digest.map(str::to_owned);
         state.remote_manifest = remote_manifest.map(str::to_owned);
+        self
+    }
+
+    /// `make <target>` prints this. Any other target fails.
+    pub fn with_make_output(mut self, target: &str, stdout: &str) -> Self {
+        self.state_mut()
+            .make_outputs
+            .insert(target.to_owned(), stdout.to_owned());
+        self
+    }
+
+    /// The compose file lists these services, one per line.
+    pub fn with_compose_services(mut self, services: &str) -> Self {
+        self.state_mut().compose_services = Some(services.to_owned());
         self
     }
 
@@ -157,6 +184,12 @@ impl FakeDocker {
                     None => failure("no digest"),
                 }
             }
+            ("docker", ["compose", "-f", _, "config", "--services"]) => {
+                match &state.compose_services {
+                    Some(services) => success(services),
+                    None => failure("no configuration file provided: not found"),
+                }
+            }
             ("docker", ["buildx", "imagetools", "inspect", ..]) => match &state.remote_manifest {
                 Some(manifest) => success(manifest),
                 None => failure("registry unreachable"),
@@ -172,6 +205,16 @@ impl FakeDocker {
                     success("")
                 } else {
                     failure("No such container")
+                }
+            }
+            ("docker", ["run", rest @ ..]) if rest.contains(&"--rm") => {
+                let output = rest
+                    .last()
+                    .and_then(|target| state.make_outputs.get(*target));
+                match (&state.image_id, output) {
+                    (None, _) => failure("Unable to find image locally"),
+                    (Some(_), Some(stdout)) => success(stdout),
+                    (Some(_), None) => failure("make: *** No rule to make target"),
                 }
             }
             ("docker", ["run", rest @ ..]) => {
@@ -190,6 +233,7 @@ impl FakeDocker {
                     (None, _) => failure("no --name given"),
                 }
             }
+            (program, _) if program != "docker" => success(""),
             _ => panic!("the fake Docker does not know this command: {line}"),
         }
     }

@@ -42,6 +42,7 @@ import {
 import { Webview, WebviewRefreshOptions, ContainerTargetInfo } from "./webview/webviewProvider";
 import { runAIReview } from "./aiReviewer";
 import { Wizard } from "./wizard";
+import { activateShell } from "./shell/activate";
 
 let outputChannel: vscode.OutputChannel;
 const appDetectionFiles = ["Cargo.toml", "ledger_app.toml", "Makefile"];
@@ -49,6 +50,22 @@ const appDetectionFiles = ["Cargo.toml", "ledger_app.toml", "Makefile"];
 console.log("Ledger: Loading extension");
 
 export function activate(context: vscode.ExtensionContext) {
+  // The experimental backend replaces everything below, so the two never run together.
+  context.subscriptions.push(
+    vscode.workspace.onDidChangeConfiguration(async (event) => {
+      if (event.affectsConfiguration("ledgerDevTools.useRustBackend")) {
+        const reload = await vscode.window.showInformationMessage("Reload the window to switch the Ledger backend.", "Reload");
+        if (reload) {
+          vscode.commands.executeCommand("workbench.action.reloadWindow");
+        }
+      }
+    }),
+  );
+  if (vscode.workspace.getConfiguration("ledgerDevTools").get<boolean>("useRustBackend")) {
+    activateShell(context).catch(error => console.error("Ledger: the Rust backend failed to start", error));
+    return;
+  }
+
   console.log(`Ledger: activating extension`);
 
   outputChannel = vscode.window.createOutputChannel("Ledger DevTools");

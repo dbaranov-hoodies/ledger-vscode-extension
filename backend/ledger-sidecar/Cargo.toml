@@ -1,0 +1,23 @@
+[package]
+name = "ledger-sidecar"
+description = "The process the Ledger Dev Tools extension talks to: JSON-RPC over stdio on top of ledger-core and ledger-runtime."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+ledger-core = { path = "../ledger-core" }
+ledger-runtime = { path = "../ledger-runtime" }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+shell-words = "1.1.1"
+tokio = { version = "1.53.2", features = ["io-std", "io-util", "macros", "rt", "sync", "time"] }
+ts-rs = "12.0.1"
+
+[dev-dependencies]
+ledger-runtime = { path = "../ledger-runtime", features = ["fake"] }

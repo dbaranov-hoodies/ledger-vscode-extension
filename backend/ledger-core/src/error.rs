@@ -12,6 +12,8 @@ pub enum Error {
     InvalidDevice(String),
     #[error("manifest lists no devices")]
     NoDevices,
+    #[error("file not found in the app folder: {0}")]
+    MissingFile(String),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

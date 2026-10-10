@@ -6,8 +6,9 @@ mod manager;
 mod runner;
 mod runs;
 
-#[cfg(test)]
-mod fake;
+/// An in-memory Docker, for tests of this crate and of the ones that use it.
+#[cfg(any(test, feature = "fake"))]
+pub mod fake;
 
 pub use log::{Log, LogEvent, LogReceiver, LogSender, Source, Stream};
 pub use manager::{Config, ContainerManager, JobOutcome, JobResult, Outcome};
