@@ -4,4 +4,4 @@ dist/
 out/
 *.vsix
 tmp/
-/core/target/
+/backend/target/

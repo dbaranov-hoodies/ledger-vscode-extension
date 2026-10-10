@@ -3,7 +3,7 @@
 out/**
 node_modules/**
 src/**
-core/**
+backend/**
 tmp/**
 .gitignore
 .yarnrc

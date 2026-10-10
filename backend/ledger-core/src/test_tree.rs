@@ -219,6 +219,39 @@ impl TestSelection {
             }
         }
     }
+
+    /// Like [`TestSelection::pytest_args`], for running pytest from the app folder: the paths
+    /// become relative to the app, given the directory of the suite the tree was collected in.
+    pub fn pytest_args_from_app(&self, tree: &TestTree, suite_directory: &str) -> Vec<String> {
+        self.pytest_args(tree)
+            .iter()
+            .map(|arg| path_from_app(suite_directory, arg))
+            .collect()
+    }
+}
+
+/// pytest prints ids relative to its root directory, which may be the suite directory, the
+/// app folder or something in between. Adds the missing part of the suite directory in front.
+fn path_from_app(suite_directory: &str, id: &str) -> String {
+    let directory = suite_directory
+        .trim_start_matches("./")
+        .trim_end_matches('/');
+    if directory.is_empty() {
+        return id.to_owned();
+    }
+    let path = id.split("::").next().unwrap_or(id);
+    if path == directory || path.starts_with(&format!("{directory}/")) {
+        return id.to_owned();
+    }
+
+    let parts: Vec<&str> = directory.split('/').collect();
+    for overlap_start in 1..parts.len() {
+        let overlap = parts[overlap_start..].join("/");
+        if path == overlap || path.starts_with(&format!("{overlap}/")) {
+            return format!("{}/{id}", parts[..overlap_start].join("/"));
+        }
+    }
+    format!("{directory}/{id}")
 }
 
 #[cfg(test)]
@@ -386,6 +419,64 @@ sub/test_deep.py::test_c
             ["test_app_mainmenu.py", "test_appname_cmd.py", "sub"]
         );
         assert!(TestSelection::default().pytest_args(&tree).is_empty());
+    }
+
+    #[test]
+    fn ids_relative_to_the_suite_get_the_suite_directory_in_front() {
+        assert_eq!(
+            path_from_app("./tests/standalone/", "test_a.py::test_x"),
+            "tests/standalone/test_a.py::test_x"
+        );
+        assert_eq!(
+            path_from_app("tests/standalone", "sub/test_a.py"),
+            "tests/standalone/sub/test_a.py"
+        );
+    }
+
+    #[test]
+    fn ids_already_relative_to_the_app_are_left_alone() {
+        assert_eq!(
+            path_from_app("tests/standalone", "tests/standalone/test_a.py::test_x"),
+            "tests/standalone/test_a.py::test_x"
+        );
+        assert_eq!(
+            path_from_app("tests/standalone", "tests/standalone"),
+            "tests/standalone"
+        );
+    }
+
+    #[test]
+    fn ids_relative_to_a_directory_in_between_only_get_the_missing_part() {
+        assert_eq!(
+            path_from_app("tests/standalone", "standalone/test_a.py::test_x"),
+            "tests/standalone/test_a.py::test_x"
+        );
+        assert_eq!(path_from_app("a/b/c", "c/test_a.py"), "a/b/c/test_a.py");
+    }
+
+    #[test]
+    fn a_suite_at_the_app_root_needs_no_prefix() {
+        assert_eq!(
+            path_from_app("./", "test_a.py::test_x"),
+            "test_a.py::test_x"
+        );
+        assert_eq!(path_from_app("", "test_a.py"), "test_a.py");
+    }
+
+    #[test]
+    fn the_selection_is_turned_into_paths_from_the_app_folder() {
+        let tree = tree();
+        let mut selection = TestSelection::default();
+        selection.set(node(&tree, "sub"), true);
+        selection.set(node(&tree, "test_appname_cmd.py::test_app_name"), true);
+
+        assert_eq!(
+            selection.pytest_args_from_app(&tree, "./tests/standalone/"),
+            [
+                "tests/standalone/test_appname_cmd.py",
+                "tests/standalone/sub"
+            ]
+        );
     }
 
     #[test]
