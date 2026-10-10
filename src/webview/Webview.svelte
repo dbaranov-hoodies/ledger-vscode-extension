@@ -4,7 +4,8 @@
   import { Popover } from "bits-ui";
   import Select, { type SelectItem } from "./components/Select.svelte";
   import StatusDot from "./components/StatusDot.svelte";
-  import ActionGroup, { type ActionGroupData, type Action } from "./components/ActionGroup.svelte";
+  import ActionGroup from "./components/ActionGroup.svelte";
+  import type { ActionGroupData, Action } from "./components/actions";
   import Toolbar from "./components/Toolbar.svelte";
   import { ChevronDown, ChevronRight, Check, X } from "@jis3r/icons";
   import TestsList from "./components/TestsList.svelte";

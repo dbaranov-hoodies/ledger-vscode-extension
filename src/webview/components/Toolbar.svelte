@@ -1,5 +1,5 @@
 <script lang="ts" module>
-  import type { ActionGroupData, Action } from "./ActionGroup.svelte";
+  import type { ActionGroupData, Action } from "./actions";
 
   interface ToolbarAction {
     id: string;
