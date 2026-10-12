@@ -217,3 +217,65 @@ fn an_app_without_a_compose_file_has_none() {
 
     assert_eq!(detected.app.compose_file, None);
 }
+
+const EXCHANGE_MANIFEST: &str = "[app]\nsdk = \"C\"\nbuild_directory = \"./\"\ndevices = [\"flex\"]\n\
+    [tests]\npytest_directory = \"./test/python/\"\n";
+const EXCHANGE_CONFTEST: &str = "def pytest_configure(config):\n\
+    \x20   configuration.OPTIONAL.SIDELOADED_APPS = {\"tezos\": \"Tezos Wallet\", \"celo\": \"Celo\"}\n\
+    \x20   configuration.OPTIONAL.SIDELOADED_APPS_DIR = \"test/python/lib_binaries/\"\n";
+
+#[test]
+fn the_apps_that_a_suite_loads_are_read_from_its_conftest() {
+    let detected = detect(&[
+        ("ledger_app.toml", EXCHANGE_MANIFEST),
+        ("test/python/conftest.py", EXCHANGE_CONFTEST),
+    ])
+    .unwrap();
+
+    let suite = &detected.app.test_suites[0];
+    assert_eq!(suite.directory.as_deref(), Some("./test/python/"));
+    let sideloaded = suite.sideloaded.as_ref().unwrap();
+    assert_eq!(sideloaded.directory, "test/python/lib_binaries");
+    let variants: Vec<&str> = sideloaded
+        .apps
+        .iter()
+        .map(|app| app.variant.as_str())
+        .collect();
+    assert_eq!(variants, ["tezos", "celo"]);
+}
+
+#[test]
+fn without_the_content_of_the_conftest_nothing_is_known_of_what_the_suite_loads() {
+    let detected = detect(&[
+        ("ledger_app.toml", EXCHANGE_MANIFEST),
+        ("test/python/conftest.py", ""),
+    ])
+    .unwrap();
+
+    assert_eq!(detected.app.test_suites[0].sideloaded, None);
+}
+
+#[test]
+fn an_app_without_a_manifest_has_its_conftest_read_too() {
+    let detected = detect(&[
+        ("Makefile", C_MAKEFILE),
+        ("tests/conftest.py", EXCHANGE_CONFTEST),
+    ])
+    .unwrap();
+
+    let sideloaded = detected.app.test_suites[0].sideloaded.as_ref().unwrap();
+    assert_eq!(sideloaded.apps.len(), 2);
+}
+
+#[test]
+fn a_deeper_conftest_does_not_make_a_suite_of_an_app_without_a_manifest() {
+    // The caller sends the conftests of the suites a manifest points at, which are deeper than
+    // the places where a suite is looked for by itself.
+    let detected = detect(&[
+        ("Makefile", C_MAKEFILE),
+        ("test/python/conftest.py", EXCHANGE_CONFTEST),
+    ])
+    .unwrap();
+
+    assert!(detected.app.test_suites.is_empty());
+}

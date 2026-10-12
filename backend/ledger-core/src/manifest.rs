@@ -7,6 +7,7 @@ use serde::de::IgnoredAny;
 use crate::device::Device;
 use crate::error::{Error, Result};
 use crate::language::Language;
+use crate::sideloaded::Sideloaded;
 
 /// A manifest of either format, told apart by its content.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -45,6 +46,9 @@ pub struct TestSuite {
     /// Directory of the tests, relative to the app.
     pub directory: Option<String>,
     pub use_cases: Vec<TestUseCase>,
+    /// The apps the `conftest.py` of the suite loads. The manifest does not say, detection reads
+    /// it from the conftest.
+    pub sideloaded: Option<Sideloaded>,
 }
 
 /// A named set of apps to build before running the functional tests.
@@ -115,6 +119,7 @@ impl AppManifest {
                     name,
                     directory: non_empty(suite.directory),
                     use_cases: parse_test_use_cases(suite.dependencies)?,
+                    sideloaded: None,
                 })
             })
             .collect::<Result<Vec<_>>>()?;
@@ -158,6 +163,7 @@ fn fold_legacy_tests(
                     name: AppManifest::STANDALONE_SUITE.to_owned(),
                     directory: None,
                     use_cases: Vec::new(),
+                    sideloaded: None,
                 },
             );
             0

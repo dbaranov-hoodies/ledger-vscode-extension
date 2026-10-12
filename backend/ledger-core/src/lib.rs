@@ -22,6 +22,7 @@ pub mod manifest;
 pub mod platform;
 pub mod rust_app;
 pub mod selection;
+pub mod sideloaded;
 pub mod snapshot;
 pub mod target;
 pub mod task;

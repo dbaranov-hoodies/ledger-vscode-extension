@@ -5,6 +5,16 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+* `Prepare Test Dependencies` and `Rebuild Test Dependencies` now also work for a test suite that ships no helper script, when its `conftest.py` declares `SIDELOADED_APPS` and `SIDELOADED_APPS_DIR` (the Exchange tests). The extension clones the coin apps it knows (the ones the Exchange CI builds) on the host, builds them in the container for each selected device, and puts them in `<SIDELOADED_APPS_DIR>/<variant>_<device>.elf`. Binaries that are already there are kept. A repository that cannot be fetched or an app that cannot be built does not stop the others: a final check lists the repositories that were not fetched and the binaries still missing, then fails the run, so the tests no longer fail one by one with `MissingElfError`.
+
+### Changed
+
+* The content of `conftest.py` is now read, to find the apps that a suite loads.
+
 ## [2.7.0]
 
 ### Added

@@ -9,6 +9,7 @@ use crate::error::{Error, Result};
 use crate::language::Language;
 use crate::manifest::{self, AppManifest, LegacyManifest, ParsedManifest, TestSuite};
 use crate::rust_app::{self, RustAppPackage};
+use crate::sideloaded;
 
 const MANIFEST_FILE: &str = "ledger_app.toml";
 const MAKEFILE: &str = "Makefile";
@@ -35,7 +36,8 @@ pub struct FolderFiles {
 
 impl FolderFiles {
     /// The names of the files to read, wherever they are in the folder up to two levels deep.
-    /// `conftest.py` and the compose file only need to be found, their content can be empty.
+    /// The compose file only needs to be found, its content can be empty. So can the content of
+    /// `conftest.py`, but then the apps that a suite loads are not known.
     pub const NAMES: [&str; 5] = [
         MANIFEST_FILE,
         MAKEFILE,
@@ -108,8 +110,21 @@ pub fn detect_app(folder: &Path, files: &FolderFiles) -> Result<Option<Detected>
     Ok(detected.map(|mut detected| {
         let compose = files.named(COMPOSE_FILE).first().map(|(path, _)| *path);
         detected.app.compose_file = compose.map(str::to_owned);
+        attach_sideloaded(&mut detected.app, files);
         detected
     }))
+}
+
+/// Reads the apps that each suite loads from its `conftest.py`, when the caller gave the content.
+fn attach_sideloaded(app: &mut App, files: &FolderFiles) {
+    for suite in &mut app.test_suites {
+        let Some(directory) = &suite.directory else {
+            continue;
+        };
+        suite.sideloaded = files
+            .get(&join_path(directory, sideloaded::CONFTEST))
+            .and_then(sideloaded::parse_conftest);
+    }
 }
 
 fn find_app(folder: &Path, files: &FolderFiles) -> Result<Option<Detected>> {
@@ -169,15 +184,18 @@ fn from_makefile(folder: &Path, makefile: &str, files: &FolderFiles) -> Detected
     }
 }
 
-/// An app that has no current manifest: its tests are wherever `conftest.py` is.
+/// An app that has no current manifest: its tests are wherever `conftest.py` is, in the folder or
+/// the one below. The caller also sends the deeper ones, for the manifest to point at.
 fn unmanifested(folder: &Path, language: Language, files: &FolderFiles) -> App {
     let test_suites = files
         .named(PYTEST_CONFIG)
-        .first()
+        .into_iter()
+        .find(|(path, _)| path.matches('/').count() <= 1)
         .map(|(path, _)| TestSuite {
             name: AppManifest::STANDALONE_SUITE.to_owned(),
             directory: Some(directory_of(path)),
             use_cases: Vec::new(),
+            sideloaded: None,
         })
         .into_iter()
         .collect();

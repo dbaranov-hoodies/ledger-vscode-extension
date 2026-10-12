@@ -1,10 +1,14 @@
-//! Preparing the apps that a test suite needs, with the helper scripts the suite ships. The
-//! scripts know what to clone and build, so the dependencies of the manifest are only a hint.
+//! Preparing the apps that a test suite needs. A suite that ships helper scripts for it gets them
+//! run: they know what to clone and build, so the dependencies of the manifest are only a hint.
+//! A suite that does not, but whose `conftest.py` loads apps that the extension knows where to
+//! get (the Exchange tests), gets them built by the extension, see [`crate::sideloaded`].
 
 use crate::app::{App, join_path};
 use crate::command::Command;
+use crate::device::Device;
 use crate::host_python::{HostPython, path_text};
-use crate::task::{InContainer, Step};
+use crate::sideloaded::{self, Sideloaded};
+use crate::task::{InContainer, PlanError, Step};
 
 pub const CLONE_SCRIPT: &str = "helper_tool_clone_dependencies.py";
 pub const BUILD_SCRIPT: &str = "helper_tool_build_dependencies.py";
@@ -13,8 +17,23 @@ const DEPENDENCIES_DIR: &str = ".test_dependencies";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TestDependencies {
-    /// The suite directory, relative to the app folder. Both scripts are in it.
+    /// The suite directory, relative to the app folder. Both scripts are in it, when it has them.
     pub suite_directory: String,
+    /// The suite ships the scripts, which then do the work.
+    pub scripts: bool,
+    /// The apps the suite loads, for a suite without scripts.
+    pub sideloaded: Option<Sideloaded>,
+}
+
+impl TestDependencies {
+    /// Whether the extension can prepare the suite, with its scripts or by itself.
+    pub fn can_be_prepared(&self) -> bool {
+        self.scripts
+            || self
+                .sideloaded
+                .as_ref()
+                .is_some_and(Sideloaded::is_buildable)
+    }
 }
 
 /// The scripts a suite needs to be prepared, relative to the app folder: the caller checks that
@@ -23,9 +42,34 @@ pub fn scripts(suite_directory: &str) -> [String; 2] {
     [CLONE_SCRIPT, BUILD_SCRIPT].map(|script| join_path(suite_directory, script))
 }
 
+/// The steps that prepare the suite for these devices. The scripts of the suite come first, and
+/// need the Python environment of the host.
+pub(crate) fn steps(
+    dependencies: &TestDependencies,
+    clean: bool,
+    app: &App,
+    devices: &[Device],
+    host: Option<&HostPython>,
+) -> Result<Vec<Step>, PlanError> {
+    if dependencies.scripts {
+        let host = host.ok_or(PlanError::NoHostPython)?;
+        return Ok(script_steps(dependencies, clean, app, host));
+    }
+    match &dependencies.sideloaded {
+        Some(sideloaded) if sideloaded.is_buildable() => Ok(sideloaded::steps(
+            app,
+            &dependencies.suite_directory,
+            sideloaded,
+            devices,
+            clean,
+        )),
+        _ => Err(PlanError::NoTestDependencies),
+    }
+}
+
 /// Clones on the host, where the Git credentials are (GitPython goes into its Python environment),
 /// then builds in the container, which has the SDKs.
-pub(crate) fn steps(
+fn script_steps(
     dependencies: &TestDependencies,
     clean: bool,
     app: &App,
@@ -77,6 +121,34 @@ mod tests {
             }),
             test_dependencies: Some(TestDependencies {
                 suite_directory: "./tests/swap/".to_owned(),
+                scripts: true,
+                sideloaded: None,
+            }),
+            ..Options::default()
+        }
+    }
+
+    fn loaded(variants: &[&str]) -> Sideloaded {
+        Sideloaded {
+            directory: "tests/libs".to_owned(),
+            apps: variants
+                .iter()
+                .map(|variant| sideloaded::SideloadedApp {
+                    variant: (*variant).to_owned(),
+                    name: (*variant).to_owned(),
+                })
+                .collect(),
+        }
+    }
+
+    /// A suite without scripts, which loads these apps. There is no Python environment on the host.
+    fn options_without_scripts(variants: &[&str]) -> Options {
+        Options {
+            host: None,
+            test_dependencies: Some(TestDependencies {
+                suite_directory: "./tests/".to_owned(),
+                scripts: false,
+                sideloaded: Some(loaded(variants)),
             }),
             ..Options::default()
         }
@@ -174,5 +246,58 @@ mod tests {
             PlanError::NoTestDependencies
         );
         assert_eq!(plan(false, &no_host).unwrap_err(), PlanError::NoHostPython);
+    }
+
+    #[test]
+    fn a_suite_without_scripts_is_prepared_by_the_extension_for_the_selected_devices() {
+        let plan = plan(false, &options_without_scripts(&["tezos"])).unwrap();
+
+        assert_eq!(plan.jobs.len(), 1, "once, not once per device");
+        let steps = &plan.jobs[0].steps;
+        // The ignore file, the four Git commands, a build for each of the two devices, the check.
+        assert_eq!(steps.len(), 1 + 4 + 2 + 1, "{steps:?}");
+        let builds: Vec<_> = steps
+            .iter()
+            .filter_map(|step| match step {
+                Step::InContainer(container) => container.sdk,
+                Step::OnHost(_) => None,
+            })
+            .collect();
+        assert_eq!(builds, [Device::Stax, Device::Flex]);
+    }
+
+    #[test]
+    fn the_scripts_of_a_suite_win_over_what_its_conftest_loads() {
+        let mut both = options();
+        both.test_dependencies.as_mut().unwrap().sideloaded = Some(loaded(&["tezos"]));
+
+        let plan = plan(false, &both).unwrap();
+
+        assert_eq!(
+            plan.jobs[0].steps.len(),
+            4,
+            "the venv, GitPython, clone, build"
+        );
+    }
+
+    #[test]
+    fn a_suite_that_loads_nothing_the_extension_can_build_cannot_be_prepared() {
+        for options in [
+            options_without_scripts(&[]),
+            options_without_scripts(&["unheard_of"]),
+        ] {
+            assert_eq!(
+                plan(false, &options).unwrap_err(),
+                PlanError::NoTestDependencies
+            );
+            assert!(!options.test_dependencies.unwrap().can_be_prepared());
+        }
+        assert!(
+            options_without_scripts(&["tezos"])
+                .test_dependencies
+                .unwrap()
+                .can_be_prepared()
+        );
+        assert!(options().test_dependencies.unwrap().can_be_prepared());
     }
 }

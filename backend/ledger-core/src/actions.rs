@@ -9,6 +9,7 @@ use crate::device_ops::{self, DeviceTask};
 use crate::docker::ContainerUser;
 use crate::environment::Environment;
 use crate::language::Language;
+use crate::manifest::TestSuite;
 use crate::selection::AppSelection;
 use crate::task::{self, ComposeRun, Options, Task, TestMode, TestRun, Variant};
 use crate::test_deps::TestDependencies;
@@ -271,7 +272,7 @@ const SPECS: [Spec; 21] = [
         Group::Tests,
         "Prepare Test Dependencies",
         "package",
-        "Clone and build the apps that the tests of the selected suite need, with the scripts of the suite (for example Exchange and Ethereum for swap tests)",
+        "Clone and build the apps that the tests of the selected suite need: with the scripts of the suite (for example Exchange and Ethereum for swap tests) or, when it has none, the apps its conftest.py loads (the coin apps of the Exchange tests)",
         Run::Task(Task::PrepareTestDependencies { clean: false }),
     ),
     spec(
@@ -452,7 +453,7 @@ fn view(spec: &Spec, app: &App, selection: &AppSelection, env: &Environment) -> 
         return None;
     }
     let prepares_tests = matches!(spec.run, Run::Task(Task::PrepareTestDependencies { .. }));
-    if prepares_tests && !env.test_helpers {
+    if prepares_tests && !prepares_dependencies(app, selection, env) {
         return None;
     }
 
@@ -518,11 +519,35 @@ fn disabled_reason(
     }
 }
 
+/// The selected test suite.
+fn selected_suite<'a>(app: &'a App, selection: &AppSelection) -> Option<&'a TestSuite> {
+    let name = selection.test_suite()?;
+    app.test_suites.iter().find(|suite| suite.name == name)
+}
+
 /// The directory of the selected test suite, relative to the app folder.
 pub fn suite_directory<'a>(app: &'a App, selection: &AppSelection) -> Option<&'a str> {
-    let name = selection.test_suite()?;
-    let suite = app.test_suites.iter().find(|suite| suite.name == name)?;
-    suite.directory.as_deref()
+    selected_suite(app, selection)?.directory.as_deref()
+}
+
+/// Whether the selected suite can be prepared: it ships the scripts that do it, or loads apps
+/// that the extension knows how to build.
+fn prepares_dependencies(app: &App, selection: &AppSelection, env: &Environment) -> bool {
+    test_dependencies(app, selection, env)
+        .is_some_and(|dependencies| dependencies.can_be_prepared())
+}
+
+fn test_dependencies(
+    app: &App,
+    selection: &AppSelection,
+    env: &Environment,
+) -> Option<TestDependencies> {
+    let suite = selected_suite(app, selection)?;
+    Some(TestDependencies {
+        suite_directory: suite.directory.clone()?,
+        scripts: env.test_helpers,
+        sideloaded: suite.sideloaded.clone(),
+    })
 }
 
 /// What the tasks need to know of the choices and the environment.
@@ -547,9 +572,7 @@ pub fn options(app: &App, selection: &AppSelection, env: &Environment) -> Option
             service,
             user: env.user,
         }),
-        test_dependencies: suite_directory.map(|directory| TestDependencies {
-            suite_directory: directory.to_owned(),
-        }),
+        test_dependencies: test_dependencies(app, selection, env),
     }
 }
 
@@ -838,6 +861,47 @@ mod tests {
         assert!(find(&with, ActionId::RebuildTestDependencies).enabled);
         assert!(maybe_find(&without, ActionId::PrepareTestDependencies).is_none());
         assert!(maybe_find(&without, ActionId::RebuildTestDependencies).is_none());
+    }
+
+    #[test]
+    fn a_suite_without_scripts_is_prepared_when_it_loads_apps_the_extension_can_build() {
+        use crate::sideloaded::{Sideloaded, SideloadedApp};
+
+        let mut app = c_app();
+        let selection = selection(&app);
+        let mut env = environment(&app);
+        env.test_helpers = false;
+        let name = selection.test_suite().unwrap().to_owned();
+        fn loads(app: &mut App, suite: &str, variant: &str) {
+            let suite = app
+                .test_suites
+                .iter_mut()
+                .find(|known| known.name == suite)
+                .unwrap();
+            suite.sideloaded = Some(Sideloaded {
+                directory: "libs".to_owned(),
+                apps: vec![SideloadedApp {
+                    variant: variant.to_owned(),
+                    name: variant.to_owned(),
+                }],
+            });
+        }
+
+        loads(&mut app, &name, "unheard_of");
+        let unknown = groups(&app, &selection, &env);
+        assert!(maybe_find(&unknown, ActionId::PrepareTestDependencies).is_none());
+
+        loads(&mut app, &name, "tezos");
+        let known = groups(&app, &selection, &env);
+        assert!(find(&known, ActionId::PrepareTestDependencies).enabled);
+        assert!(find(&known, ActionId::RebuildTestDependencies).enabled);
+
+        // The plan needs no script: the ignore file, the four Git commands, a build for the
+        // selected device and the check that the binary is there.
+        let plan = plan(ActionId::PrepareTestDependencies, &app, &selection, &env)
+            .unwrap()
+            .unwrap();
+        assert_eq!(plan.jobs[0].steps.len(), 1 + 4 + 1 + 1);
     }
 
     #[test]

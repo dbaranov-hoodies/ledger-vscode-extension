@@ -35,8 +35,9 @@ pub enum Task {
     Device(DeviceTask),
     /// A terminal in the service of the app's `docker-compose.yml`.
     ComposeTerminal,
-    /// Clones and builds the apps the tests of a suite need, with the scripts of the suite.
-    /// `clean` throws away what was prepared before.
+    /// Clones and builds the apps the tests of a suite need, with the scripts of the suite or,
+    /// for a suite without any, the apps its `conftest.py` loads. `clean` throws away what was
+    /// prepared before.
     PrepareTestDependencies {
         clean: bool,
     },
@@ -165,7 +166,7 @@ impl Step {
     pub fn continue_on_error(&self) -> bool {
         match self {
             Self::InContainer(step) => step.continue_on_error,
-            Self::OnHost(_) => false,
+            Self::OnHost(step) => step.continue_on_error,
         }
     }
 }
@@ -176,6 +177,8 @@ pub struct OnHost {
     pub command: Command,
     /// The command is typed into, as a shell is.
     pub tty: bool,
+    /// The job goes on when this step fails.
+    pub continue_on_error: bool,
 }
 
 impl OnHost {
@@ -183,11 +186,17 @@ impl OnHost {
         Self {
             command,
             tty: false,
+            continue_on_error: false,
         }
     }
 
     pub fn tty(mut self) -> Self {
         self.tty = true;
+        self
+    }
+
+    pub fn keep_going(mut self) -> Self {
+        self.continue_on_error = true;
         self
     }
 }
@@ -426,8 +435,9 @@ pub fn plan_task(
                 .test_dependencies
                 .as_ref()
                 .ok_or(PlanError::NoTestDependencies)?;
-            let host = options.host.as_ref().ok_or(PlanError::NoHostPython)?;
-            run_once(&devices, test_deps::steps(dependencies, clean, app, host))
+            let steps =
+                test_deps::steps(dependencies, clean, app, &devices, options.host.as_ref())?;
+            run_once(&devices, steps)
         }
     };
     Ok(Plan {

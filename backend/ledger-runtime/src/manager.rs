@@ -1379,6 +1379,82 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_host_step_that_keeps_going_lets_the_others_run_and_a_failing_check_ends_the_job() {
+        use ledger_core::task::OnHost;
+
+        // The first repository cannot be fetched. The second one still is, and the check that
+        // lists what is missing comes last and fails the job.
+        let docker = FakeDocker::new()
+            .fail("fetch app-bitcoin-dev", 128)
+            .fail("check missing", 1);
+        let (sender, mut receiver) = log::channel();
+        let manager = ContainerManager::new(&docker, config()).with_logs(sender);
+        let keeping_going = |argv: &[&str]| {
+            Step::OnHost(
+                OnHost::new(Command::new(argv[0]).args(argv[1..].iter().copied())).keep_going(),
+            )
+        };
+        let plan = task::Plan {
+            jobs: vec![Job {
+                device: Device::Stax,
+                steps: vec![
+                    keeping_going(&["git", "fetch", "app-bitcoin-dev"]),
+                    keeping_going(&["git", "fetch", "app-tezos-dev"]),
+                    Step::on_host(Command::new("check").arg("missing")),
+                ],
+            }],
+            warnings: Vec::new(),
+        };
+
+        let results = manager.run_plan(&plan).await;
+
+        assert!(matches!(
+            &results[0].outcome,
+            JobOutcome::Failed { step: 2, reason } if reason.contains("check missing")
+        ));
+        assert_eq!(
+            docker.calls(),
+            [
+                "git fetch app-bitcoin-dev",
+                "git fetch app-tezos-dev",
+                "check missing"
+            ],
+            "the repository after the one that failed was still fetched"
+        );
+        let events = drain(&mut receiver);
+        assert_eq!(
+            notes(&events, &Source::Container(Device::Stax)),
+            ["step 1 failed, going on"]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_host_step_that_keeps_going_and_fails_does_not_fail_a_job_that_ends_well() {
+        use ledger_core::task::OnHost;
+
+        let docker = FakeDocker::new().fail("fetch app-bitcoin-dev", 128);
+        let manager = ContainerManager::new(&docker, config());
+        let plan = task::Plan {
+            jobs: vec![Job {
+                device: Device::Stax,
+                steps: vec![
+                    Step::OnHost(
+                        OnHost::new(Command::new("git").args(["fetch", "app-bitcoin-dev"]))
+                            .keep_going(),
+                    ),
+                    Step::on_host(Command::new("check").arg("everything")),
+                ],
+            }],
+            warnings: Vec::new(),
+        };
+
+        let results = manager.run_plan(&plan).await;
+
+        assert_eq!(results[0].outcome, JobOutcome::Succeeded);
+        assert_eq!(docker.calls().len(), 2);
+    }
+
+    #[tokio::test]
     async fn a_device_job_on_the_host_does_not_make_the_container_busy() {
         let docker = FakeDocker::new();
         let manager = ContainerManager::new(&docker, config());
